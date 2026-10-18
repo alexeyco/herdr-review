@@ -13,6 +13,8 @@ pub(crate) struct Context {
     pub(crate) focused_pane_id: Option<String>,
     /// `focused_pane_agent`, when a non-blank string.
     pub(crate) focused_pane_agent: Option<String>,
+    /// `tab_id` — the focused pane's tab, when a non-blank string.
+    pub(crate) tab_id: Option<String>,
 }
 
 /// Parses the plugin context and extracts the fields the review action uses.
@@ -27,6 +29,7 @@ pub(crate) fn parse(json: &str) -> Result<Context, String> {
         workspace_id: opt_string(&v, "workspace_id"),
         focused_pane_id: opt_string(&v, "focused_pane_id"),
         focused_pane_agent: opt_string(&v, "focused_pane_agent"),
+        tab_id: opt_string(&v, "tab_id"),
     })
 }
 
@@ -83,6 +86,7 @@ mod tests {
         assert_eq!(ctx.workspace_id.as_deref(), Some("ws-1"));
         assert_eq!(ctx.focused_pane_id.as_deref(), Some("p1"));
         assert_eq!(ctx.focused_pane_agent.as_deref(), Some("claude"));
+        assert_eq!(ctx.tab_id.as_deref(), Some("t1"));
     }
 
     #[test]
@@ -131,15 +135,29 @@ mod tests {
         assert!(ctx.workspace_id.is_none());
         assert!(ctx.focused_pane_id.is_none());
         assert!(ctx.focused_pane_agent.is_none());
+        assert!(ctx.tab_id.is_none());
     }
 
     #[test]
     fn optional_fields_blank_or_non_string_are_none() {
-        let json = r#"{"workspace_cwd":"/repo","workspace_id":" ","focused_pane_id":7,"focused_pane_agent":null}"#;
+        let json = r#"{"workspace_cwd":"/repo","workspace_id":" ","focused_pane_id":7,"focused_pane_agent":null,"tab_id":"  "}"#;
         let ctx = parse(json).unwrap();
         assert!(ctx.workspace_id.is_none());
         assert!(ctx.focused_pane_id.is_none());
         assert!(ctx.focused_pane_agent.is_none());
+        assert!(ctx.tab_id.is_none());
+    }
+
+    #[test]
+    fn non_string_tab_id_is_absent() {
+        // A `tab_id` that is not a string counts as absent; the caller-tab
+        // pair is then omitted from the review-pane open.
+        for json in [
+            r#"{"workspace_cwd":"/repo","tab_id":42}"#,
+            r#"{"workspace_cwd":"/repo","tab_id":null}"#,
+        ] {
+            assert!(parse(json).unwrap().tab_id.is_none(), "{json}");
+        }
     }
 
     #[test]

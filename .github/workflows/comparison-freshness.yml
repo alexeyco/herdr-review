@@ -1,0 +1,142 @@
+# Monthly freshness check of the README `## Comparison` section: machine
+# drift opens (or updates) the rolling dual-update fix PR, drift the
+# script must not rewrite files or updates the single `comparison-drift`
+# issue — drift is alarmed, not a build failure, so those runs stay
+# green — and an unreachable source goes red without opening a PR or
+# filing an issue: a run that could not reach its sources cannot vouch
+# for the table.
+name: comparison-freshness
+
+on:
+  schedule:
+    # Day 1 at 06:00 UTC — monthly, so the rot window is bounded at 31
+    # days.
+    - cron: "0 6 1 * *"
+  workflow_dispatch:
+
+# Serialize dispatch against the scheduled run: two concurrent runs could
+# both see zero open comparison-drift issues in the dedup GET and both
+# POST, or race on the fix branch. Pending runs wait rather than cancel —
+# the check is cheap and the rot window is a month wide.
+concurrency:
+  group: comparison-freshness
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      # Actions does not export the token as an environment variable
+      # automatically; release.yml is the repo precedent for the explicit
+      # secret-to-env mapping. Job level, not step level, because every
+      # consumer needs it: the check and fix steps' GitHub API calls
+      # (authenticated 5000/h instead of the shared-runner-IP anonymous
+      # 60/h) and the issue step's REST calls.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # DUAL-UPDATE RULE: on drift, update BOTH the README `## Comparison`
+      # release cells and this line together — the script judges these
+      # values against the live sources and checks the README's presence
+      # substrings against them; `--fix` moves the two surfaces as one.
+      # No self entry for alexeyco/herdr-review: the subject's release
+      # cell is deliberately unpinned, so there is no machine-checkable
+      # self release fact.
+      EXPECT_REPOS: persiyanov/herdr-reviewr@v0.46.0,jhochenbaum/herdr-hunk-diff@v0.5.0,JanSmrcka/differ@v1.8.1,quantk/herdr-review@v0.2.7,skellleks/lasso@v0.1.0
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          # No cache key and no npm ci: the script imports Node builtins
+          # only, so dependencies are never installed.
+      - name: Check the README comparison table
+        id: check
+        # Capture the exit code instead of failing the step: 0 clean,
+        # 1 drift (fix PR and issue below), 2 unreachable source (red run
+        # below). Any other code is an environment failure (127 node
+        # missing, 137 killed): fail the step now — the conditional steps
+        # below key on exact codes, so neither a PR nor an issue happens.
+        # Every run, clean ones included, leaves a job-summary audit trail.
+        run: |
+          set +e
+          node scripts/check-comparison.mjs --report drift-report.md --summary "$GITHUB_STEP_SUMMARY"
+          code=$?
+          case "$code" in 0|1|2) ;; *) echo "comparison-check: unknown exit code $code" >&2; exit "$code";; esac
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Dual-update the README release cells and the workflow env line
+        if: steps.check.outputs.code == '1'
+        # A failing --fix (exit 2 — a live source unreachable) reddens the
+        # run and skips the PR and issue steps: the same alarm philosophy
+        # as an unreachable source in check mode.
+        run: node scripts/check-comparison.mjs --fix
+      - name: Format the README for the ci.yml prettier gate
+        if: steps.check.outputs.code == '1'
+        # pull_request workflows do not fire for PRs opened with the
+        # default GITHUB_TOKEN, so the committed README must satisfy the
+        # ci.yml prettier check on the master push after merge — write
+        # before the commit. A no-op when the fixer changed nothing.
+        run: npx --yes prettier@3.9.6 --write README.md
+      - name: Open the rolling dual-update fix PR
+        if: steps.check.outputs.code == '1'
+        # Rolling semantics: while a PR on this branch is open, the next
+        # drifting run updates it instead of opening a second PR.
+        # add-paths is the PR write set: only the two dual-update surfaces
+        # (README.md and this workflow) may ever enter a commit. The
+        # check step's drift-report.md (issue-only drift writes it at the
+        # repo root) is unmatched — the action stashes and restores
+        # unmatched files, so the report stays out of the PR (no
+        # report-only PR, no stale copy merged to master) while the issue
+        # step below still reads it after the action. When the fixer
+        # changed nothing the write set is empty, so the action creates
+        # no PR (issue-only-drift runs). delete-branch cleans up after
+        # merge. The bot never pushes master; the maintainer merges.
+        uses: peter-evans/create-pull-request@v8
+        with:
+          branch: chore/comparison-freshness
+          base: master
+          delete-branch: true
+          add-paths: |
+            README.md
+            .github/workflows/comparison-freshness.yml
+          commit-message: "Comparison: dual-update release tags (monthly freshness run)"
+          title: "Comparison: dual-update release tags (monthly freshness run)"
+          body: |
+            ## What
+
+            Monthly `comparison-freshness` run: the fixer dual-updated the
+            README `## Comparison` release cells and this workflow's
+            `EXPECT_REPOS` line together — the two surfaces always move as
+            one. While this PR is open, the next drifting run updates this
+            same branch instead of opening a second PR; `delete-branch`
+            cleans up after merge. Issue-only findings, if any, are alarmed
+            in the separate `comparison-drift` issue, not here.
+
+            ## Untouched by design
+
+            The ✅/⚠️/❌ matrix cells, the footnotes, and the
+            `All cells checked <date> against the linked public sources.`
+            line are never rewritten by this run — the human-audit date
+            moves only by human hand. The README is formatted with
+            prettier@3.9.6 before the commit, so the PR passes the ci.yml
+            md gate.
+
+            The bot never pushes master; the maintainer merges.
+      - name: File or update the comparison-drift issue
+        if: steps.check.outputs.code == '1'
+        # Machine-fixable-only drift writes no report file, so this guard
+        # stays silent and the fix PR is the only alarm. Issue mode dedups
+        # by label, so repeat drift PATCHes the same open issue.
+        run: |
+          if [ -f drift-report.md ]; then
+            node scripts/check-comparison.mjs --report-issue drift-report.md
+          fi
+      - name: Go red when a source was unreachable
+        if: steps.check.outputs.code == '2'
+        run: |
+          echo "comparison-check: exit 2 — a source was unreachable, so no PR was opened and no issue was filed; see the findings above" >&2
+          exit 1
