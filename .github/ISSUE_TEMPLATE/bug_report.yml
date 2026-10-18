@@ -8,13 +8,30 @@ body:
       label: Checks
       options:
         - label: I am running a supported herdr version (see README → Requirements)
-        - label: I have revdiff >= 1.12 on PATH (or set REVDIFF_BIN), or the failing step does not need it
+        - label: The review tool I picked is at its minimum version and on the herdr daemon's PATH (see README → The tool catalog), or the failing step does not need it
         - label: I searched existing issues for this problem
+  - type: dropdown
+    id: tool
+    attributes:
+      label: Review tool
+      description: The tool you picked in the picker when the bug happened.
+      options:
+        - revdiff
+        - tuicr
+        - lumen
+        - Not tool-specific
+    validations:
+      required: true
   - type: textarea
     id: what-happened
     attributes:
       label: What happened?
-      description: Include the exact error message from the action or from `herdr plugin log list --plugin revdiff`.
+      description: >-
+        Include the exact error message, the scope line the review pane printed
+        before the tool opened (`herdr-review: reviewing uncommitted changes`,
+        `herdr-review: reviewing vs <base>`, or `herdr-review: nothing to
+        review`), and anything relevant from `herdr plugin log list --plugin
+        review`.
     validations:
       required: true
   - type: textarea
@@ -33,7 +50,7 @@ body:
       value: |
         - OS:
         - herdr --version:
-        - revdiff --version:
+        - review tool and version (revdiff/tuicr/lumen --version):
         - Invocation method:
     validations:
       required: true

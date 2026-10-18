@@ -1,17 +1,18 @@
 [package]
-name = "herdr-revdiff"
-version = "0.1.0"
+name = "herdr-review"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.96.1"
-description = "herdr plugin that runs revdiff in a new tab and passes review annotations to the agent"
-repository = "https://github.com/alexeyco/herdr-revdiff"
+description = "herdr plugin that runs a review tool in a new tab and passes review annotations to the agent"
+repository = "https://github.com/alexeyco/herdr-review"
 readme = "README.md"
-keywords = ["herdr", "revdiff", "plugin", "cli", "code-review"]
+keywords = ["herdr", "review", "plugin", "cli", "code-review"]
 categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 serde_json = "1"
+toml = "1"
 
 [profile.release]
 lto = true

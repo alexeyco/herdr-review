@@ -4,7 +4,7 @@
 
 - Install [rustup](https://rustup.rs); the pinned toolchain comes from `rust-toolchain.toml` on first build.
 - herdr >= 0.9.0 for linking and testing.
-- [revdiff](https://github.com/umputun/revdiff) >= 1.12 on `PATH` for exercising the review flow.
+- At least one review tool on the herdr daemon's `PATH` for exercising the review flow: [revdiff](https://github.com/umputun/revdiff) >= 1.12, [tuicr](https://github.com/agavra/tuicr) >= 0.27.0, or [lumen](https://github.com/jnsahaj/lumen) >= 2.26.0. Tools resolve from `PATH` only.
 
 ## Checks
 
