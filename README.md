@@ -39,6 +39,74 @@ Or invoke the action from the CLI:
 herdr plugin action invoke alexeyco.review.open
 ```
 
+## Comparison
+
+How this plugin compares with the five other diff-review tools that integrate with herdr, cell by cell as documented in their public sources.
+
+✅ documented in the linked sources · ⚠️ partial or implemented differently · ❌ not found in the public sources checked
+
+|                                                                                                                                          | [herdr-review](https://github.com/alexeyco/herdr-review) | [reviewr](https://github.com/persiyanov/herdr-reviewr) | [hunk-diff](https://github.com/jhochenbaum/herdr-hunk-diff) | [differ](https://github.com/JanSmrcka/differ) | [quantk](https://github.com/quantk/herdr-review) | [lasso](https://github.com/skellleks/lasso) |
+| ---------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------ | ----------------------------------------------------------- | --------------------------------------------- | ------------------------------------------------ | ------------------------------------------- |
+| Ships a herdr-plugin manifest (installs via `herdr plugin install`)                                                                      | ✅                                                       | ✅[^1]                                                 | ✅                                                          | ❌[^2]                                        | ✅                                               | ✅                                          |
+| Human-authored line annotations                                                                                                          | ✅                                                       | ✅                                                     | ✅                                                          | ✅                                            | ✅                                               | ✅                                          |
+| Dedicated git-diff review surface                                                                                                        | ✅                                                       | ✅                                                     | ✅                                                          | ✅                                            | ✅                                               | ✅                                          |
+| Delivers on close, no extra keypress (annotations reach the agent pane when the review closes — key- or action-triggered delivery is ⚠️) | ✅                                                       | ⚠️[^3]                                                 | ⚠️[^4]                                                      | ⚠️[^5]                                        | ⚠️[^6]                                           | ⚠️[^7]                                      |
+| Agent-agnostic delivery                                                                                                                  | ✅                                                       | ✅[^8]                                                 | ✅[^9]                                                      | ✅[^10]                                       | ✅[^11]                                          | ⚠️[^12]                                     |
+| No LLM keys or accounts in the core flow                                                                                                 | ✅[^13]                                                  | ✅[^14]                                                | ✅[^15]                                                     | ✅[^16]                                       | ✅[^17]                                          | ✅[^18]                                     |
+| User-selectable underlying review tool                                                                                                   | ✅                                                       | ❌                                                     | ❌                                                          | ❌                                            | ❌                                               | ❌                                          |
+
+[^1]: reviewr ships `herdr-plugin.toml` in the repository tree — [source](https://github.com/persiyanov/herdr-reviewr).
+
+[^2]: differ ships no `herdr-plugin.toml` in its repository tree; its README documents brew/go install and a "works with herdr" badge — [source](https://github.com/JanSmrcka/differ).
+
+[^3]: reviewr binds `s` to pane.send_text and leaves the review unsubmitted — [source](https://github.com/persiyanov/herdr-reviewr).
+
+[^4]: hunk-diff delivers through an explicit send-review action that runs `herdr agent prompt` — [source](https://github.com/jhochenbaum/herdr-hunk-diff).
+
+[^5]: differ's `S` key submits the review via `herdr agent prompt` — a manual keypress — [source](https://github.com/JanSmrcka/differ).
+
+[^6]: quantk's F7 drafts the annotations and never submits them — [source](https://github.com/quantk/herdr-review).
+
+[^7]: lasso delivers through a Shift+S keypress — [source](https://github.com/skellleks/lasso).
+
+[^8]: reviewr documents delivery to Claude Code, Codex, OpenCode, and Pi — [source](https://github.com/persiyanov/herdr-reviewr).
+
+[^9]: hunk-diff's delivery code treats agent kinds as not addressable (`src/herdr.ts:73`) — [source](https://github.com/jhochenbaum/herdr-hunk-diff/blob/v0.5.0/src/herdr.ts).
+
+[^10]: differ documents delivery to claude, codex, gemini, copilot, opencode, and aider — [source](https://github.com/JanSmrcka/differ).
+
+[^11]: quantk passes an opaque agentKind through to herdr — [source](https://github.com/quantk/herdr-review).
+
+[^12]: lasso's core delivery is generic; its cross-repo discovery is Claude-only (`src/runtime.rs:258`) — [source](https://github.com/skellleks/lasso/blob/v0.1.0/src/runtime.rs).
+
+[^13]: herdr-review — no LLM keys or accounts in the core flow: none of the three catalog tools needs LLM credentials for this flow — [docs/how-it-works.md](docs/how-it-works.md).
+
+[^14]: reviewr — no LLM keys or accounts required or documented in the core flow (only its PR tab needs a `gh`/`glab`/`az` token) — negative search 2026-10-18 — [source](https://github.com/persiyanov/herdr-reviewr).
+
+[^15]: hunk-diff — no LLM keys or accounts required or documented in the core flow (local bundled hunk viewer; requirements are herdr, node, npm) — negative search 2026-10-18 — [source](https://github.com/jhochenbaum/herdr-hunk-diff).
+
+[^16]: differ — no LLM keys or accounts required or documented in the core flow ("no model reads your diff") — negative search 2026-10-18 — [source](https://github.com/JanSmrcka/differ).
+
+[^17]: quantk — no LLM keys or accounts required or documented in the core flow (performs no network access; assets bundled) — negative search 2026-10-18 — [source](https://github.com/quantk/herdr-review).
+
+[^18]: lasso — no LLM keys or accounts required or documented in the core flow (human review only) — negative search 2026-10-18 — [source](https://github.com/skellleks/lasso).
+
+All cells checked 2026-10-18 against the linked public sources.
+
+<details>
+<summary>Detailed comparison</summary>
+
+|                    | [herdr-review](https://github.com/alexeyco/herdr-review)                                  | [reviewr](https://github.com/persiyanov/herdr-reviewr)                                | [hunk-diff](https://github.com/jhochenbaum/herdr-hunk-diff)                              | [differ](https://github.com/JanSmrcka/differ)                                                            | [quantk](https://github.com/quantk/herdr-review)                                 | [lasso](https://github.com/skellleks/lasso)                                  |
+| ------------------ | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| Delivery form      | herdr plugin (manifest install) ([repo](https://github.com/alexeyco/herdr-review))        | herdr plugin (manifest install) ([repo](https://github.com/persiyanov/herdr-reviewr)) | herdr plugin (manifest install) ([repo](https://github.com/jhochenbaum/herdr-hunk-diff)) | standalone binary (brew/go install) integrating with herdr ([repo](https://github.com/JanSmrcka/differ)) | herdr plugin (manifest install) ([repo](https://github.com/quantk/herdr-review)) | herdr plugin (manifest install) ([repo](https://github.com/skellleks/lasso)) |
+| Underlying tool    | user-selected: revdiff / tuicr / lumen ([repo](https://github.com/alexeyco/herdr-review)) | single built-in viewer ([repo](https://github.com/persiyanov/herdr-reviewr))          | single built-in viewer ([repo](https://github.com/jhochenbaum/herdr-hunk-diff))          | single built-in viewer ([repo](https://github.com/JanSmrcka/differ))                                     | single built-in viewer ([repo](https://github.com/quantk/herdr-review))          | single built-in viewer ([repo](https://github.com/skellleks/lasso))          |
+| Latest release     | [releases](https://github.com/alexeyco/herdr-review/releases)                             | [v0.46.0](https://github.com/persiyanov/herdr-reviewr/releases/tag/v0.46.0)           | [v0.5.0](https://github.com/jhochenbaum/herdr-hunk-diff/releases/tag/v0.5.0)             | [v1.8.1](https://github.com/JanSmrcka/differ/releases/tag/v1.8.1)                                        | [v0.2.7](https://github.com/quantk/herdr-review/releases/tag/v0.2.7)             | [v0.1.0](https://github.com/skellleks/lasso/releases/tag/v0.1.0)             |
+| License / language | [MIT · Rust](https://github.com/alexeyco/herdr-review)                                    | [MIT · Rust](https://github.com/persiyanov/herdr-reviewr)                             | [MIT · TypeScript](https://github.com/jhochenbaum/herdr-hunk-diff)                       | [MIT · Go](https://github.com/JanSmrcka/differ)                                                          | [MIT · JavaScript](https://github.com/quantk/herdr-review)                       | [MIT · Rust](https://github.com/skellleks/lasso)                             |
+
+</details>
+
+Among the tools compared above, this plugin is the only one that combines annotation delivery into the agent pane on review close — no extra keypress — with a user-selectable underlying review tool. The five competitors each deliver annotations through a key or an action, and each ships a single built-in viewer.
+
 ## The flow
 
 1. The **action** (`alexeyco.review.open`) resolves the repository and the caller identity from the plugin context, reads `config.toml` once, and checks the configured `tool` against the daemon's `PATH`. A valid id with an executable binary opens the **review pane** directly — the main path, no dialog. Otherwise (unset, blank, invalid, or valid but missing from `PATH`) it opens the read-only **setup dialog** instead and no review pane opens: the dialog shows one universal layout — the config file path, the three catalog rows with their dim inline install commands, and the repository URL — and `Enter`, `q`, and `Esc` each close it.
