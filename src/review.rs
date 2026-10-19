@@ -172,16 +172,41 @@ struct ChildResult {
 /// stdio strategy and waits for it to exit. A spawn failure (for example the
 /// binary was removed between resolution and spawn) is the hard error
 /// `failed to run <bin> in <dir>: <error>`.
+///
+/// On Linux a freshly written executable can transiently fail `exec` with
+/// `ETXTBSY` (Text file busy) while the kernel still sees a write reference,
+/// so that one error is retried a bounded number of times; every other spawn
+/// failure is returned immediately.
 fn spawn_child(tool_id: &str, argv: &[String], dir: &Path) -> Result<ChildResult, String> {
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..]).current_dir(dir);
-    if stdio_plan(tool_id).0 == StreamPlan::Piped {
-        // Piped stdout, inherited stderr: the pipe is drained to completion
-        // while the child runs, so a large export cannot deadlock.
-        cmd.stdout(Stdio::piped());
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to run {} in {}: {e}", argv[0], dir.display()))?;
+    #[cfg(unix)]
+    const ETXTBSY: i32 = 26;
+    #[cfg(not(unix))]
+    const ETXTBSY: i32 = -1;
+    const ETXTBSY_RETRIES: u32 = 5;
+
+    let piped = stdio_plan(tool_id).0 == StreamPlan::Piped;
+    let mut child = {
+        let mut attempt = 0;
+        loop {
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]).current_dir(dir);
+            if piped {
+                // Piped stdout, inherited stderr: the pipe is drained to
+                // completion while the child runs, so a large export cannot
+                // deadlock.
+                cmd.stdout(Stdio::piped());
+            }
+            match cmd.spawn() {
+                Ok(child) => break child,
+                Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < ETXTBSY_RETRIES => {
+                    attempt += 1;
+                    std::thread::sleep(Duration::from_millis(20 * u64::from(attempt)));
+                }
+                Err(e) => return Err(spawn_error(&e, argv, dir)),
+            }
+        }
+    };
+    if piped {
         let output = child
             .wait_with_output()
             .map_err(|e| format!("failed to wait for {}: {e}", argv[0]))?;
@@ -190,14 +215,18 @@ fn spawn_child(tool_id: &str, argv: &[String], dir: &Path) -> Result<ChildResult
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         })
     } else {
-        let status = cmd
-            .status()
-            .map_err(|e| format!("failed to run {} in {}: {e}", argv[0], dir.display()))?;
+        let status = child
+            .wait()
+            .map_err(|e| format!("failed to wait for {}: {e}", argv[0]))?;
         Ok(ChildResult {
             code: status.code(),
             stdout: String::new(),
         })
     }
+}
+
+fn spawn_error(e: &std::io::Error, argv: &[String], dir: &Path) -> String {
+    format!("failed to run {} in {}: {e}", argv[0], dir.display())
 }
 
 /// Everything the collection stage needs about one review run.
