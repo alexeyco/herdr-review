@@ -1,67 +1,57 @@
-//! The review-tool catalog and PATH-only binary resolution.
-//!
-//! The catalog is fixed — `lumen`, `revdiff`, `tuicr`, in the setup dialog's
-//! alphabetical row order — and is not user-configurable. A tool counts as
-//! installed when a `PATH` entry,
-//! scanned in order with empty entries skipped, contains an executable regular
-//! file with its name; there is deliberately no environment-variable override
-//! for any tool (the pre-rename, revdiff-specific override variable was
-//! removed), so all three tools resolve the same way from the herdr daemon's
-//! `PATH`.
-//!
-//! The pane process resolves the selected tool's binary immediately before
-//! spawning it: the path is canonicalized to an absolute one, and a candidate
-//! that cannot be canonicalized is an error rather than a cwd-relative guess
-//! (the pane's cwd may default to the plugin directory, not the repo).
-
 use std::path::{Path, PathBuf};
 
 /// The pane environment variable carrying the selected tool id.
 const TOOL_ENV: &str = "HERDR_REVIEW_TOOL";
 
-/// One catalog tool: a stable id plus the install command shown when missing.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Tool {
-    /// Catalog id, also the binary name on `PATH` and the `HERDR_REVIEW_TOOL` value.
-    pub(crate) id: &'static str,
-    /// Install hint: shown dim inline after the tool name in the setup
-    /// dialog's rows and quoted in resolution errors.
-    pub(crate) install: &'static str,
+/// A supported review tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReviewTool {
+    Lumen,
+    Revdiff,
+    Tuicr,
 }
 
-/// The fixed catalog, in the setup dialog's alphabetical row order.
-pub(crate) static CATALOG: [Tool; 3] = [
-    Tool {
-        id: "lumen",
-        install: "brew install jnsahaj/lumen/lumen",
-    },
-    Tool {
-        id: "revdiff",
-        install: "brew install umputun/apps/revdiff",
-    },
-    Tool {
-        id: "tuicr",
-        install: "brew install tuicr",
-    },
-];
+impl ReviewTool {
+    pub(crate) const ALL: [Self; 3] = [Self::Lumen, Self::Revdiff, Self::Tuicr];
 
-/// Looks up a catalog row by id.
-pub(crate) fn by_id(id: &str) -> Option<&'static Tool> {
-    CATALOG.iter().find(|tool| tool.id == id)
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::Lumen => "lumen",
+            Self::Revdiff => "revdiff",
+            Self::Tuicr => "tuicr",
+        }
+    }
+
+    pub(crate) fn install_hint(self) -> &'static str {
+        match self {
+            Self::Lumen => "brew install jnsahaj/lumen/lumen",
+            Self::Revdiff => "brew install umputun/apps/revdiff",
+            Self::Tuicr => "brew install tuicr",
+        }
+    }
+
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|tool| tool.id() == id)
+    }
+}
+
+/// Looks up a supported tool by id.
+pub(crate) fn by_id(id: &str) -> Option<ReviewTool> {
+    ReviewTool::from_id(id)
 }
 
 /// Reads the selected tool id from the pane environment (trimmed). An unset or
 /// blank value and an unknown value are errors that precede any git probe or
 /// spawn; the messages tell the user to come back through the review action,
 /// which is the only path that sets the variable.
-pub(crate) fn selected() -> Result<&'static Tool, String> {
+pub(crate) fn selected() -> Result<ReviewTool, String> {
     let raw = std::env::var(TOOL_ENV).unwrap_or_default();
     selected_from(&raw)
 }
 
 /// [`selected`] against an already-read raw env value, so tests exercise the
 /// error paths without mutating the process environment.
-fn selected_from(raw: &str) -> Result<&'static Tool, String> {
+fn selected_from(raw: &str) -> Result<ReviewTool, String> {
     let id = raw.trim();
     if id.is_empty() {
         return Err(format!(
@@ -74,28 +64,29 @@ fn selected_from(raw: &str) -> Result<&'static Tool, String> {
 /// Resolves the tool's binary from the process `PATH`: the first entry,
 /// scanned in order with empty entries skipped, that contains an executable
 /// regular file named `<tool>`, canonicalized to an absolute path.
-pub(crate) fn resolve(tool: &Tool) -> Result<String, String> {
+pub(crate) fn resolve(tool: ReviewTool) -> Result<String, String> {
     let path = std::env::var("PATH").unwrap_or_default();
     resolve_in(tool, &path)
 }
 
 /// [`resolve`] against an explicit `PATH` string, without touching the process
 /// environment.
-fn resolve_in(tool: &Tool, path: &str) -> Result<String, String> {
-    let candidate = find_candidate(path, tool.id).ok_or_else(|| {
+fn resolve_in(tool: ReviewTool, path: &str) -> Result<String, String> {
+    let candidate = find_candidate(path, tool.id()).ok_or_else(|| {
         format!(
             "{} not found on PATH; install it with {}",
-            tool.id, tool.install
+            tool.id(),
+            tool.install_hint()
         )
     })?;
-    canonical_absolute(&candidate, tool.id).map(|p| p.to_string_lossy().into_owned())
+    canonical_absolute(&candidate, tool.id()).map(|p| p.to_string_lossy().into_owned())
 }
 
 /// The catalog tools that have an executable on `path`, in catalog order.
-pub(crate) fn installed(path: &str) -> Vec<&'static Tool> {
-    CATALOG
-        .iter()
-        .filter(|tool| find_candidate(path, tool.id).is_some())
+pub(crate) fn installed(path: &str) -> Vec<ReviewTool> {
+    ReviewTool::ALL
+        .into_iter()
+        .filter(|tool| find_candidate(path, tool.id()).is_some())
         .collect()
 }
 
@@ -143,7 +134,6 @@ fn is_executable_file(path: &Path) -> bool {
 mod tests {
     use super::*;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// The removed per-tool override variable, spelled as two fragments so
     /// the removal grep over `src` and `tests` stays clean while this test
@@ -181,30 +171,25 @@ mod tests {
     /// A canonicalized scratch directory, removed when the test ends, so
     /// comparisons survive symlinked temp roots (`/var` → `/private/var` on
     /// macOS).
-    struct TempDir(PathBuf);
+    struct TempDir {
+        path: PathBuf,
+        _temp: tempfile::TempDir,
+    }
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "herdr-review-tool-test-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(std::fs::canonicalize(&dir).unwrap())
+            let temp = tempfile::Builder::new()
+                .prefix(&format!("herdr-review-tool-test-{tag}-"))
+                .tempdir()
+                .unwrap();
+            Self {
+                path: std::fs::canonicalize(temp.path()).unwrap(),
+                _temp: temp,
+            }
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            &self.path
         }
     }
 
@@ -237,7 +222,7 @@ mod tests {
         write_binary(dir.path(), "tuicr", true);
         let installed = installed(&path_of(&[dir.path()]));
         assert_eq!(
-            installed.iter().map(|t| t.id).collect::<Vec<_>>(),
+            installed.iter().map(|t| t.id()).collect::<Vec<_>>(),
             ["tuicr"]
         );
     }
@@ -286,18 +271,18 @@ mod tests {
     fn no_binary_anywhere() {
         // Scenario "No binary anywhere": the error names the tool and its
         // catalog install hint — the brew command the sketch pinned.
-        for tool in CATALOG.iter() {
+        for tool in ReviewTool::ALL {
             for path in ["", ":", "/nonexistent-dir-for-herdr-review-test"] {
                 let err = resolve_in(tool, path).unwrap_err();
                 assert!(
-                    err.contains(&format!("{} not found on PATH", tool.id)),
+                    err.contains(&format!("{} not found on PATH", tool.id())),
                     "{err}"
                 );
-                assert!(err.contains(tool.install), "{err}");
+                assert!(err.contains(tool.install_hint()), "{err}");
                 assert!(
-                    tool.install.starts_with("brew install "),
+                    tool.install_hint().starts_with("brew install "),
                     "{}",
-                    tool.install
+                    tool.install_hint()
                 );
             }
         }
@@ -346,24 +331,24 @@ mod tests {
         // come straight from the catalog in its order, each with its
         // user-sketched brew install command.
         assert_eq!(
-            CATALOG.iter().map(|t| t.id).collect::<Vec<_>>(),
+            ReviewTool::ALL.iter().map(|t| t.id()).collect::<Vec<_>>(),
             ["lumen", "revdiff", "tuicr"]
         );
         assert_eq!(
-            by_id("lumen").unwrap().install,
+            by_id("lumen").unwrap().install_hint(),
             "brew install jnsahaj/lumen/lumen"
         );
         assert_eq!(
-            by_id("revdiff").unwrap().install,
+            by_id("revdiff").unwrap().install_hint(),
             "brew install umputun/apps/revdiff"
         );
-        assert_eq!(by_id("tuicr").unwrap().install, "brew install tuicr");
+        assert_eq!(by_id("tuicr").unwrap().install_hint(), "brew install tuicr");
     }
 
     #[test]
     fn by_id_finds_every_catalog_row() {
-        for tool in CATALOG.iter() {
-            assert_eq!(by_id(tool.id).map(|t| t.id), Some(tool.id));
+        for tool in ReviewTool::ALL {
+            assert_eq!(by_id(tool.id()).map(ReviewTool::id), Some(tool.id()));
         }
         assert!(by_id("diffy").is_none());
     }
@@ -371,8 +356,8 @@ mod tests {
     #[test]
     fn valid_tool_id_selects_the_tool() {
         // Scenario "Valid tool id selects the tool".
-        assert_eq!(selected_from("lumen").unwrap().id, "lumen");
-        assert_eq!(selected_from("  tuicr  ").unwrap().id, "tuicr");
+        assert_eq!(selected_from("lumen").unwrap(), ReviewTool::Lumen);
+        assert_eq!(selected_from("  tuicr  ").unwrap(), ReviewTool::Tuicr);
     }
 
     #[test]

@@ -1,31 +1,8 @@
-//! herdr plugin that reviews the current workspace with a review tool.
-//!
-//! The binary is tri-mode, dispatched from the plugin environment:
-//! - action mode (`HERDR_PLUGIN_ACTION_ID` set, entrypoint unset) resolves the
-//!   repository from the plugin context, reads `config.toml` once, and opens
-//!   the review pane directly when the configured tool is usable — otherwise
-//!   it opens the read-only setup popup — then exits immediately.
-//! - setup mode (`HERDR_PLUGIN_ENTRYPOINT_ID=setup`) runs inside that popup:
-//!   it shows the one universal layout — the config file path, the fixed
-//!   catalog rows with their install commands, and the repository URL —
-//!   and closes on any key.
-//! - review-pane mode (`HERDR_PLUGIN_ENTRYPOINT_ID=review`) runs inside the
-//!   review pane: it spawns the chosen tool on the pane tty, collects its
-//!   annotations, and delivers them to the agent pane that requested the
-//!   review.
-//!
-//! Plugin docs: https://herdr.dev/docs/plugins/
+//! herdr plugin that runs a review tool and delivers its annotations.
 
+mod adapters;
 mod config;
-mod context;
-mod convert;
-mod git;
-mod herdr;
-mod review;
-mod setup;
-mod theme;
-mod tool;
-mod tuicr;
+mod features;
 
 fn main() {
     if let Err(e) = run() {
@@ -33,7 +10,7 @@ fn main() {
         // Plugin panes auto-close when this process exits, so pane-mode errors
         // must block until the user has read the message.
         if env_set("HERDR_PLUGIN_ENTRYPOINT_ID") {
-            review::hold_pane();
+            features::review::hold_pane();
         }
         std::process::exit(1);
     }
@@ -73,9 +50,9 @@ fn run_mode() -> Result<RunMode, String> {
 
 fn run() -> Result<(), String> {
     match run_mode()? {
-        RunMode::Review => review::run_pane(),
-        RunMode::Setup => setup::run(),
-        RunMode::Action => review::run_action(),
+        RunMode::Review => features::review::run_pane(),
+        RunMode::Setup => features::setup::SetupDialog::run(),
+        RunMode::Action => features::review::run_action(),
         RunMode::Outside => Err("invoked outside herdr plugin context".to_string()),
     }
 }

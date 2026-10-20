@@ -20,7 +20,28 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use crate::convert::{self, Comment};
+use crate::features::review::annotations::{self, Comment};
+
+/// The tuicr CLI and repository used for one review run.
+pub(crate) struct TuicrClient<'a> {
+    bin: &'a str,
+    dir: &'a Path,
+}
+
+impl<'a> TuicrClient<'a> {
+    pub(crate) fn new(bin: &'a str, dir: &'a Path) -> Self {
+        Self { bin, dir }
+    }
+
+    pub(crate) fn collect_comments(&self, launched_at: SystemTime) -> Result<Vec<Comment>, String> {
+        collect_comments(
+            self.dir,
+            launched_at,
+            &|args| exec_tuicr(self.bin, self.dir, args),
+            &|args| exec_git(self.dir, args),
+        )
+    }
+}
 
 /// Collects this run's tuicr comments. `run_tuicr` and `run_git` execute one
 /// command in the review directory and return its stdout (production spawns
@@ -97,7 +118,7 @@ fn fetch_comments(
     slug: &str,
 ) -> Result<Vec<Comment>, String> {
     let json = run(&["review", "comments", "--session", slug])?;
-    convert::parse_comments(&json)
+    annotations::parse_comments(&json)
 }
 
 /// Predicts the session slug from read-only git probes: the `origin` remote

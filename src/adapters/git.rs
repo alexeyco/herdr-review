@@ -7,6 +7,8 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+use crate::adapters::tool::ReviewTool;
+
 /// Which changes a review covers for the resolved directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Scope {
@@ -32,20 +34,17 @@ impl Scope {
     /// places it before the fixed trailing flags) while `VsBase`'s are the
     /// two positional refs (placed after them); the other tools consume one
     /// plain list.
-    pub(crate) fn fragments(&self, tool_id: &str) -> Vec<String> {
-        match (self, tool_id) {
-            (Scope::Uncommitted, "revdiff") => vec!["--untracked".to_string()],
-            (Scope::Uncommitted, "tuicr") => vec!["-w".to_string()],
-            (Scope::Uncommitted, "lumen") => Vec::new(),
-            (Scope::VsBase(base), "revdiff") => vec![base.clone(), "HEAD".to_string()],
-            (Scope::VsBase(base), "tuicr") => {
+    pub(crate) fn fragments(&self, tool: ReviewTool) -> Vec<String> {
+        match (self, tool) {
+            (Scope::Uncommitted, ReviewTool::Revdiff) => vec!["--untracked".to_string()],
+            (Scope::Uncommitted, ReviewTool::Tuicr) => vec!["-w".to_string()],
+            (Scope::Uncommitted, ReviewTool::Lumen) => Vec::new(),
+            (Scope::VsBase(base), ReviewTool::Revdiff) => vec![base.clone(), "HEAD".to_string()],
+            (Scope::VsBase(base), ReviewTool::Tuicr) => {
                 vec!["-r".to_string(), format!("{base}..HEAD")]
             }
-            (Scope::VsBase(base), "lumen") => vec![format!("{base}...HEAD")],
+            (Scope::VsBase(base), ReviewTool::Lumen) => vec![format!("{base}...HEAD")],
             (Scope::NothingToReview, _) => Vec::new(),
-            // The caller only passes catalog ids; an unknown id has no
-            // fragments rather than silently launching a bare tool.
-            (_, _) => Vec::new(),
         }
     }
 }
@@ -66,6 +65,40 @@ pub(crate) struct GitStatus {
     pub(crate) base: Option<String>,
 }
 
+/// Read-only access to one repository.
+pub(crate) struct GitRepository<'a> {
+    dir: &'a Path,
+}
+
+impl<'a> GitRepository<'a> {
+    pub(crate) fn new(dir: &'a Path) -> Self {
+        Self { dir }
+    }
+
+    pub(crate) fn status(&self) -> GitStatus {
+        match try_probe(self.dir) {
+            Ok(status) => status,
+            Err(e) => {
+                eprintln!(
+                    "herdr-review: git probe failed ({}): {}; nothing to review",
+                    e.cmd, e.err
+                );
+                GitStatus::default()
+            }
+        }
+    }
+
+    pub(crate) fn review_scope(&self) -> Scope {
+        select_scope(&self.status())
+    }
+}
+
+impl crate::features::review::ports::ReviewRepository for GitRepository<'_> {
+    fn scope(&self) -> Scope {
+        self.review_scope()
+    }
+}
+
 /// Picks the review scope from a git state. Pure: every branch is unit-tested.
 pub(crate) fn select_scope(s: &GitStatus) -> Scope {
     if !s.repo || !s.has_head {
@@ -84,17 +117,9 @@ pub(crate) fn select_scope(s: &GitStatus) -> Scope {
 /// failure (spawn error, or an exit code outside the documented meanings) one
 /// warning is written to stderr and a non-repo status is returned, which
 /// selects the nothing-to-review hold path.
-pub(crate) fn probe(dir: &Path) -> GitStatus {
-    match try_probe(dir) {
-        Ok(status) => status,
-        Err(e) => {
-            eprintln!(
-                "herdr-review: git probe failed ({}): {}; nothing to review",
-                e.cmd, e.err
-            );
-            GitStatus::default()
-        }
-    }
+#[cfg(test)]
+fn probe(dir: &Path) -> GitStatus {
+    GitRepository::new(dir).status()
 }
 
 /// A failed probe: the command that ran and what went wrong.
@@ -255,34 +280,21 @@ fn command(args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A canonicalized scratch directory, removed when the test ends.
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "herdr-review-git-test-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(std::fs::canonicalize(&dir).unwrap())
+            let dir = tempfile::Builder::new()
+                .prefix(&format!("herdr-review-git-test-{tag}-"))
+                .tempdir()
+                .unwrap();
+            Self(dir)
         }
 
         fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            self.0.path()
         }
     }
 
@@ -422,19 +434,32 @@ mod tests {
     #[test]
     fn uncommitted_fragments_per_tool() {
         // Scenario "Uncommitted fragments per tool".
-        assert_eq!(Scope::Uncommitted.fragments("revdiff"), ["--untracked"]);
-        assert_eq!(Scope::Uncommitted.fragments("tuicr"), ["-w"]);
-        assert!(Scope::Uncommitted.fragments("lumen").is_empty());
-        assert!(Scope::NothingToReview.fragments("revdiff").is_empty());
+        assert_eq!(
+            Scope::Uncommitted.fragments(ReviewTool::Revdiff),
+            ["--untracked"]
+        );
+        assert_eq!(Scope::Uncommitted.fragments(ReviewTool::Tuicr), ["-w"]);
+        assert!(Scope::Uncommitted.fragments(ReviewTool::Lumen).is_empty());
+        assert!(
+            Scope::NothingToReview
+                .fragments(ReviewTool::Revdiff)
+                .is_empty()
+        );
     }
 
     #[test]
     fn vs_base_fragments_per_tool() {
         // Scenario "Vs-base fragments per tool".
         let scope = Scope::VsBase("origin/main".to_string());
-        assert_eq!(scope.fragments("revdiff"), ["origin/main", "HEAD"]);
-        assert_eq!(scope.fragments("tuicr"), ["-r", "origin/main..HEAD"]);
-        assert_eq!(scope.fragments("lumen"), ["origin/main...HEAD"]);
+        assert_eq!(
+            scope.fragments(ReviewTool::Revdiff),
+            ["origin/main", "HEAD"]
+        );
+        assert_eq!(
+            scope.fragments(ReviewTool::Tuicr),
+            ["-r", "origin/main..HEAD"]
+        );
+        assert_eq!(scope.fragments(ReviewTool::Lumen), ["origin/main...HEAD"]);
     }
 
     #[test]
@@ -442,7 +467,7 @@ mod tests {
         // Scenario "revdiff uses two positional refs, not a range argument":
         // the fragment is `<base> HEAD` as two positionals, never a single
         // `base..HEAD` argument.
-        let fragments = Scope::VsBase("origin/main".to_string()).fragments("revdiff");
+        let fragments = Scope::VsBase("origin/main".to_string()).fragments(ReviewTool::Revdiff);
         assert_eq!(fragments, ["origin/main", "HEAD"]);
         assert!(!fragments.iter().any(|f| f.contains("..")), "{fragments:?}");
     }
