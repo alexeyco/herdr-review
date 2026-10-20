@@ -16,7 +16,7 @@ herdr plugin log list --plugin alexeyco.review
 
 The action calls back into herdr through `HERDR_BIN_PATH` (set by herdr), not through a bare `herdr` on `PATH`. That is the binary herdr launched, so callbacks work even when the plugin is linked.
 
-To exercise the review flow you need the review tool you configure installed — [revdiff](https://github.com/umputun/revdiff) >= 1.12, [tuicr](https://github.com/agavra/tuicr) >= 0.27.0, or [lumen](https://github.com/jnsahaj/lumen) >= 2.26.0 — with `tool = "<id>"` in the plugin's `config.toml`. Tools resolve from the `PATH` of the herdr daemon (there is no override variable), so install the tool and restart herdr when it is missing. `make test` needs no tools at all — the integration suite drives stubs.
+To exercise the review flow, install one or more supported tools — [revdiff](https://github.com/umputun/revdiff) >= 1.12, [tuicr](https://github.com/agavra/tuicr) >= 0.27.0, or [lumen](https://github.com/jnsahaj/lumen) >= 2.26.0 — on the herdr daemon's `PATH`. The action opens the only installed tool directly, shows a picker when several are installed, and opens setup guidance when none are found. `config.toml` controls placement and direction only. `make test` needs no review tools — the integration suite drives stubs.
 
 ## Checks
 
@@ -42,14 +42,14 @@ make fmt-check   # prettier check
 
 A fifth stub, `git`, makes `diff --quiet` exit 2 (an undocumented quiet-diff code) and delegates everything else to the real git resolved at test start; a `git`-less `PATH` covers spawn failure. Fixtures build real repositories in a unique temp directory with an inline git identity, so no global git config is needed.
 
-The setup-dialog unit tests in `src/setup.rs` drive the dialog over injected seams instead of a terminal: an in-memory reader/writer pair for the key loop and frames, a fixed theme palette, a scripted key source whose `None` entries model the `stty min 0 time 1` read timeout, and a recording `stty` fake that pins the raw-mode enter/restore protocol. The e2e `stty` stub (a sixth script on `PATH`) runs the dialog's real raw-mode path over piped stdin. Action e2e runs write a real `config.toml` under `HERDR_PLUGIN_CONFIG_DIR` — `tool = "revdiff"` with the stub on `PATH` drives the direct open; no key, a tool absent from `PATH`, or `tool = "diffy"` drives the setup branch.
+Picker unit tests in `src/features/picker.rs` cover rendering and remembered-choice state; setup-dialog tests in `src/features/setup.rs` render through Ratatui's test backend. Setup-dialog e2e runs use the non-interactive text fallback. Action e2e tests create `config.toml` under `HERDR_PLUGIN_CONFIG_DIR` to cover placement and direction, while PATH stubs cover zero, one, and multiple installed tools and the obsolete `tool` key.
 
 ## Manual smoke test
 
 ```
 make build
 herdr plugin link .
-herdr plugin list                     # shows alexeyco.review 0.2.0
+herdr plugin list                     # shows alexeyco.review 0.3.0
 herdr plugin action invoke alexeyco.review.open
 ```
 
@@ -62,10 +62,10 @@ herdr plugin action invoke alexeyco.review.open
    command = "alexeyco.review.open"
    ```
 
-2. Happy path, per tool (revdiff, tuicr, lumen): set `tool = "<id>"` in the plugin's `config.toml`, focus an agent pane, and invoke the action — the review pane opens directly, no dialog. Review a dirty repo (`herdr-review: reviewing uncommitted changes`), author an annotation, and export — quit revdiff with annotations, let the tuicr TUI save its session, or press `s`→Enter in lumen. The annotations arrive in the agent as one prompt prefixed `Review annotations from <tool>:`.
+2. Install one tool on the herdr daemon's `PATH`, focus an agent pane, and invoke the action — its review pane opens directly. Install a second tool and invoke again — the picker opens; use Up/Down, Enter, and Esc to select or cancel. Review a dirty repo (`herdr-review: reviewing uncommitted changes`), author an annotation, and export — quit revdiff with annotations, let the tuicr TUI save its session, or press `s`→Enter in lumen. The annotations arrive in the agent as one prompt prefixed `Review annotations from <tool>:`.
 3. Quit the tool without annotating → nothing is sent.
 4. Clean repo with an `origin` remote → `herdr-review: reviewing vs origin/main` and the tool opens the base comparison; clean repo without a remote → `herdr-review: nothing to review` and the pane holds.
-5. Remove the `tool` key (or set it to a tool missing from `PATH`, or an invalid value) → the action opens the setup dialog showing the one universal layout — the config path, the catalog rows with their dim inline install commands, and the repo URL; `Enter`, `q`, and `Esc` each close it and no review pane opens.
+5. Remove all supported tools from the daemon's `PATH` → the action opens the setup dialog showing the config path, install commands, and repository URL; any key closes it and no review pane opens.
 6. Invoke the action from a pane with no agent → the annotations are kept on disk, the path is printed in the plugin log, and the review pane waits for Enter before closing.
 7. Config: `placement = "split"` + `direction = "down"` opens a split; `placement = "popup"` warns and falls back to a tab; a corrupt `config.toml` warns and uses defaults.
 8. Inspect the log: `herdr plugin log list --plugin alexeyco.review`.

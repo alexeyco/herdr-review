@@ -90,6 +90,12 @@ pub(crate) fn installed(path: &str) -> Vec<ReviewTool> {
         .collect()
 }
 
+/// The ids of catalog tools with an executable on `path`, in catalog order.
+/// Detection uses the same PATH-only executable-file rules as [`installed`].
+pub(crate) fn installed_ids(path: &str) -> Vec<&'static str> {
+    installed(path).into_iter().map(ReviewTool::id).collect()
+}
+
 /// The first executable regular file named `id` among `path` entries, in
 /// order. Empty entries are skipped.
 fn find_candidate(path: &str, id: &str) -> Option<PathBuf> {

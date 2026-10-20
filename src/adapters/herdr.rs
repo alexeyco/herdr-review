@@ -7,11 +7,12 @@
 //! the review pane (reply parsed best-effort: exit status 0 already means the
 //! pane exists, so an unparsable reply is a warning, not an error).
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-use crate::config::{Config, Placement};
+use crate::features::review::ports::OpenToolPicker;
+use crate::settings::{Config, Placement};
 
 /// The plugin's manifest id — the `--plugin` value of every pane open and
 /// the key of the `plugin config-dir` callback.
@@ -80,6 +81,55 @@ pub(crate) fn open_setup_popup() -> Result<(), String> {
     let args = setup_pane_open_args();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     exec(&refs).map(|_| ())
+}
+
+/// Opens the borderless picker popup and forwards the review launch context
+/// for the picker pane to use after a selection.
+pub(crate) fn open_tool_picker(request: &OpenToolPicker<'_>) -> Result<(), String> {
+    let args = tool_picker_open_args(request);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    exec(&refs).map(|_| ())
+}
+
+fn tool_picker_open_args(request: &OpenToolPicker<'_>) -> Vec<String> {
+    let mut args = base_pane_open_args("picker", "popup");
+    let mut env = vec![
+        format!(
+            "HERDR_REVIEWS_PICKER_TOOL_IDS={}",
+            request.tool_ids.join(",")
+        ),
+        format!("HERDR_REVIEWS_DIR={}", request.dir),
+    ];
+    env.push(format!(
+        "HERDR_REVIEWS_PLACEMENT={}",
+        request.config.placement.as_str()
+    ));
+    env.push(format!(
+        "HERDR_REVIEWS_DIRECTION={}",
+        match request.config.direction {
+            crate::settings::Direction::Right => "right",
+            crate::settings::Direction::Down => "down",
+            crate::settings::Direction::Auto => "auto",
+        }
+    ));
+    if let Some(workspace) = request.workspace {
+        env.push(format!("HERDR_REVIEWS_WORKSPACE={workspace}"));
+    }
+    if let Some(pane) = request.caller_pane {
+        env.push(format!("HERDR_REVIEWS_CALLER_PANE={pane}"));
+    }
+    if let Some(agent) = request.caller_agent {
+        env.push(format!("HERDR_REVIEWS_CALLER_AGENT={agent}"));
+    }
+    if let Some(tab) = request.caller_tab {
+        env.push(format!("HERDR_REVIEWS_CALLER_TAB={tab}"));
+    }
+    for pair in env {
+        args.push("--env".to_string());
+        args.push(pair);
+    }
+    args.push("--focus".to_string());
+    args
 }
 
 /// Opens the review pane after a tool is chosen. On exec success the reply is
@@ -292,6 +342,81 @@ pub(crate) fn tab_focus(tab_id: &str) -> Result<(), String> {
     exec(&["tab", "focus", tab_id]).map(|_| ())
 }
 
+/// Starts a detached helper that closes the picker popup before re-focusing
+/// the selected review tab. The popup's normal exit restores the old focus,
+/// so the focus request must run after that close completes.
+pub(crate) fn schedule_picker_focus(tab_id: &str) -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve picker helper executable: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .env("HERDR_REVIEWS_INTERNAL_MODE", "focus-after-picker")
+        .env("HERDR_REVIEWS_PICKER_FOCUS_TAB", tab_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("cannot start picker focus helper: {error}"))
+}
+
+/// Closes the active popup through Herdr's socket API. `popup_not_open` is a
+/// successful outcome because the popup may already have exited naturally.
+#[cfg(unix)]
+pub(crate) fn close_popup() -> Result<(), String> {
+    let socket = std::env::var("HERDR_SOCKET_PATH")
+        .map_err(|_| "HERDR_SOCKET_PATH is missing; cannot close picker popup".to_string())?;
+    close_popup_at(&socket)
+}
+
+#[cfg(unix)]
+fn close_popup_at(socket: &str) -> Result<(), String> {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| format!("cannot connect to herdr socket {socket}: {error}"))?;
+    stream
+        .write_all(
+            b"{\"id\":\"herdr-review-picker-close\",\"method\":\"popup.close\",\"params\":{}}\n",
+        )
+        .map_err(|error| format!("cannot send popup.close request: {error}"))?;
+    let mut reply = String::new();
+    BufReader::new(stream)
+        .read_line(&mut reply)
+        .map_err(|error| format!("cannot read popup.close reply: {error}"))?;
+    popup_close_reply(&reply)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn close_popup() -> Result<(), String> {
+    Err("popup close socket transport is unavailable on this platform".to_string())
+}
+
+fn popup_close_reply(reply: &str) -> Result<(), String> {
+    let value: Value = serde_json::from_str(reply)
+        .map_err(|error| format!("invalid popup.close reply: {error}"))?;
+    if value.get("result").is_some() {
+        return Ok(());
+    }
+    let error = value.get("error");
+    if error
+        .and_then(|value| value.get("code"))
+        .and_then(Value::as_str)
+        == Some("popup_not_open")
+    {
+        return Ok(());
+    }
+    let detail = error
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    Err(format!("herdr popup.close failed: {detail}"))
+}
+
 /// Submits `text` to the agent hosted in `target_pane`.
 pub(crate) fn agent_prompt(target_pane: &str, text: &str) -> Result<(), String> {
     exec(&["agent", "prompt", target_pane, text]).map(|_| ())
@@ -309,7 +434,7 @@ fn snippet(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Direction;
+    use crate::settings::Direction;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -371,7 +496,6 @@ mod tests {
         Config {
             placement,
             direction,
-            tool: None,
         }
     }
 
@@ -769,6 +893,42 @@ mod tests {
             let _env = BinEnv::set(bin.to_str().unwrap());
             assert!(open_setup_popup().is_ok());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popup_close_uses_socket_and_accepts_already_closed_popup() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut request = String::new();
+            stream.read_line(&mut request).unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(request["method"], "popup.close");
+            assert_eq!(request["params"], serde_json::json!({}));
+            let mut stream = stream.into_inner();
+            stream
+                .write_all(b"{\"error\":{\"code\":\"popup_not_open\",\"message\":\"no popup\"}}\n")
+                .unwrap();
+        });
+
+        close_popup_at(socket.to_str().unwrap()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn popup_close_reply_rejects_unrelated_errors() {
+        let error = popup_close_reply(
+            r#"{"error":{"code":"ui_busy","message":"another modal is active"}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(error, "herdr popup.close failed: another modal is active");
     }
 
     #[test]

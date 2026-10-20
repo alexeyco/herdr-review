@@ -13,10 +13,8 @@ use ratatui::widgets::{Block, Paragraph, Wrap};
 
 use crate::adapters::tool::ReviewTool;
 
-pub(crate) mod theme;
-
 const CONFIG_FILE_LINE: &str = "Config file:";
-const ADD_TOOLS_LINE: &str = "Add one of these tools to config:";
+const ADD_TOOLS_LINE: &str = "Install one of these review tools:";
 const MORE_INFO_LINE: &str = "For more information:";
 const REPO_URL: &str = "https://github.com/alexeyco/herdr-review";
 const CONFIG_DIR_HINT: &str = "herdr plugin config-dir alexeyco.review";
@@ -24,7 +22,6 @@ const FOOTER: &str = "enter/q/esc close";
 
 pub(crate) struct SetupDialog {
     config_line: String,
-    palette: theme::Palette,
 }
 
 impl SetupDialog {
@@ -33,12 +30,11 @@ impl SetupDialog {
             config_line: config_dir
                 .map(|dir| dir.join("config.toml").display().to_string())
                 .unwrap_or_else(|| CONFIG_DIR_HINT.to_string()),
-            palette: theme::resolve_palette(),
         }
     }
 
     pub(crate) fn run() -> Result<(), String> {
-        let dialog = Self::new(crate::config::resolve_dir().as_deref());
+        let dialog = Self::new(crate::settings::resolve_dir().as_deref());
         if !std::io::stdin().is_terminal() {
             return dialog.run_plain();
         }
@@ -90,10 +86,7 @@ impl SetupDialog {
 
     fn render(&self, frame: &mut Frame<'_>) {
         let area = frame.area();
-        let palette = self.palette;
-        let base = Style::default()
-            .fg(to_color(palette.text))
-            .bg(to_color(palette.panel_bg));
+        let base = Style::default().fg(Color::Reset).bg(Color::Reset);
         frame.render_widget(Block::default().style(base), area);
 
         let [content, footer] =
@@ -107,12 +100,7 @@ impl SetupDialog {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    FOOTER,
-                    Style::default()
-                        .fg(to_color(palette.overlay1))
-                        .bg(to_color(palette.panel_bg)),
-                ),
+                Span::styled(FOOTER, Style::default().add_modifier(Modifier::DIM)),
             ]))
             .style(base),
             footer,
@@ -156,32 +144,6 @@ fn line(text: &str) -> Line<'_> {
     Line::from(vec![Span::raw("  "), Span::raw(text)])
 }
 
-fn to_color(color: theme::TokenColor) -> Color {
-    match color {
-        theme::TokenColor::Rgb(red, green, blue) => Color::Rgb(red, green, blue),
-        theme::TokenColor::Ansi(code) => match code {
-            30 => Color::Black,
-            31 => Color::Red,
-            32 => Color::Green,
-            33 => Color::Yellow,
-            34 => Color::Blue,
-            35 => Color::Magenta,
-            36 => Color::Cyan,
-            37 => Color::Gray,
-            90 => Color::DarkGray,
-            91 => Color::LightRed,
-            92 => Color::LightGreen,
-            93 => Color::LightYellow,
-            94 => Color::LightBlue,
-            95 => Color::LightMagenta,
-            96 => Color::LightCyan,
-            97 => Color::White,
-            _ => Color::Reset,
-        },
-        theme::TokenColor::Default => Color::Reset,
-    }
-}
-
 fn is_key_event(event: &Event) -> bool {
     matches!(event, Event::Key(_))
 }
@@ -193,14 +155,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn dialog() -> SetupDialog {
-        let mut dialog = SetupDialog::new(Some(Path::new("/cfg/review")));
-        dialog.palette = theme::Palette {
-            accent: theme::TokenColor::Rgb(137, 180, 250),
-            panel_bg: theme::TokenColor::Rgb(24, 24, 37),
-            text: theme::TokenColor::Rgb(205, 214, 244),
-            overlay1: theme::TokenColor::Rgb(127, 132, 156),
-        };
-        dialog
+        SetupDialog::new(Some(Path::new("/cfg/review")))
     }
 
     fn draw(width: u16, height: u16) -> String {
@@ -222,7 +177,7 @@ mod tests {
         for expected in [
             "Config file:",
             "/cfg/review/config.toml",
-            "Add one of these tools to config:",
+            "Install one of these review tools:",
             "revdiff",
             "tuicr",
             "lumen",

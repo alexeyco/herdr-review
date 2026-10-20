@@ -100,9 +100,15 @@ fn side_marker(side: Option<&str>) -> &'static str {
 /// `**path** lines A-B (LEFT)`, or a bare `**path**` (file-level). Remaining
 /// lines of a block are the annotation text. `# <ref>` headers and other
 /// unrecognized lines before the first block are dropped.
-pub(crate) fn lumen_to_canonical(raw: &str) -> Option<String> {
+#[cfg(test)]
+fn lumen_to_canonical(raw: &str) -> Option<String> {
     let stripped = strip_terminal_escapes(raw);
-    let blocks = parse_lumen_blocks(&stripped);
+    lumen_to_canonical_stripped(&stripped)
+}
+
+/// Converts a Lumen export after terminal escapes have already been removed.
+pub(crate) fn lumen_to_canonical_stripped(stripped: &str) -> Option<String> {
+    let blocks = parse_lumen_blocks(stripped);
     if blocks.is_empty() {
         return if stripped.trim().is_empty() {
             Some(String::new())

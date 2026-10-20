@@ -1,7 +1,7 @@
 # Manifest reference: https://herdr.dev/docs/plugins/
 id = "alexeyco.review"
 name = "Review"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.9.0"
 description = "Runs a review tool in a new herdr tab and passes review annotations to the agent in the focused pane"
 platforms = ["linux", "macos"]
@@ -28,4 +28,12 @@ title = "Review tool setup"
 placement = "popup"
 width = "60%"
 height = 15
+command = ["./target/release/herdr-review"]
+
+[[panes]]
+id = "picker"
+title = "Choose review tool"
+placement = "popup"
+width = 38
+height = 7
 command = ["./target/release/herdr-review"]

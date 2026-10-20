@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::adapters::git::Scope;
 use crate::adapters::tool::ReviewTool;
-use crate::config::Config;
+use crate::settings::Config;
 
 use super::process::ChildResult;
 
@@ -23,10 +23,21 @@ pub(crate) trait ReviewActionHost {
         &self,
         request: OpenReview<'a>,
     ) -> Result<Option<crate::adapters::herdr::PaneIds>, String>;
+    fn open_tool_picker<'a>(&self, request: OpenToolPicker<'a>) -> Result<(), String>;
     fn open_setup(&self) -> Result<(), String>;
     fn focus(&self, tab_id: &str) -> Result<(), String>;
     fn log(&self, message: &str);
     fn warn(&self, message: &str);
+}
+
+pub(crate) struct OpenToolPicker<'a> {
+    pub(crate) tool_ids: &'a [&'static str],
+    pub(crate) config: &'a Config,
+    pub(crate) dir: &'a str,
+    pub(crate) workspace: Option<&'a str>,
+    pub(crate) caller_pane: Option<&'a str>,
+    pub(crate) caller_agent: Option<&'a str>,
+    pub(crate) caller_tab: Option<&'a str>,
 }
 
 pub(crate) struct OpenReview<'a> {

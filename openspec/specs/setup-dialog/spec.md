@@ -1,33 +1,34 @@
-# setup-dialog Specification
+# Setup Dialog
 
 ## Purpose
 
 The setup-dialog capability is the read-only popup pane the review action
-opens when no usable review tool is configured. It shows one universal
+opens when no supported review tool is installed. It shows one universal
 layout — the config file path, the static catalog with install commands,
-and the repo URL — telling the user how to configure a tool, and closes on
-any key. It never branches on install or config state, never selects a
-tool, never writes state, and never opens a review pane: the config file
-is the only chooser.
+and the repo URL — as guidance for installing a supported tool, and closes
+on any key. It never branches on install or config state, never selects a
+tool, never writes state, and never opens a review pane. The config path is
+informational; users do not configure a tool there.
 
 ## Requirements
 
 ### Requirement: The dialog shows one universal layout for every entry case
 
-The dialog SHALL render the same content for every reason it was opened
-(`tool` unset, blank, invalid, configured-but-missing, or nothing
-installed): a `Config file:` line with the resolved config path, an
-`Add one of these tools to config:` line with the three static catalog
+The dialog SHALL render the same content whenever it is opened because no
+catalog tool is installed: a `Config file:` line with the resolved config path,
+an
+`Install one of these review tools:` line with the three static catalog
 rows, a `For more information:` line with the repository URL, and the
-pinned footer. No branch status line, no PATH state, and no greyed rows
-are rendered; the dialog performs no PATH detection at all.
+pinned footer. The guidance SHALL NOT ask users to configure a `tool` key.
+No branch status line, no PATH state, and no greyed rows are rendered; the
+dialog performs no PATH detection at all.
 
 #### Scenario: Every entry case renders the same dialog
 
-- **WHEN** the popup opens for any of the entry cases — `tool` unset,
-  blank, invalid, configured-but-missing, or no catalog tool installed
+- **WHEN** the popup opens because no catalog tool is installed
 - **THEN** the rendered content is identical in all of them apart from the
-  config path value, and no line states which case occurred
+  config path value, no line states which case occurred, and no line asks
+  the user to configure a `tool` key
 
 #### Scenario: Tool rows are alphabetical with dim inline install commands
 
@@ -62,7 +63,7 @@ umputun/apps/revdiff`, `brew install tuicr`
 
 The dialog SHALL keep the blank top line, indent every content line with a
 visible left padding of two columns, and fill each line to the full width
-with the panel background as the right padding. The manifest's `setup`
+with terminal-default background as the right padding. The manifest's `setup`
 pane SHALL declare popup size keys fitted to the content without
 scrolling: `width = "60%"` and `height = 15` (13 content lines plus a
 two-line wrap margin for long config paths — live-probed clipping).
@@ -71,8 +72,8 @@ two-line wrap margin for long config paths — live-probed clipping).
 
 - **WHEN** any frame is drawn
 - **THEN** the first line is blank, every content line starts with the
-  two-column left padding, and the panel-background fill extends every
-  line to the full drawable width
+  two-column left padding, and terminal-default background fills the
+  remaining drawable width
 
 #### Scenario: Content fits the declared popup height
 
@@ -93,51 +94,45 @@ no movement keys and no highlighted row.
 - **THEN** no herdr call is made, no file is written, and the process
   exits 0
 
-#### Scenario: Escape cancels
+#### Scenario: Any key event closes the dialog
 
-- **WHEN** a lone Escape keypress arrives (terminal still open)
-- **THEN** the dialog closes as if `q` was pressed; the key reader uses a
-  short (~0.1 s) timeout, not a blocking read, so a lone Escape is
-  distinguishable from a closed terminal
+- **WHEN** a key event arrives while the terminal is open
+- **THEN** the dialog closes without interpreting movement or selection keys
 
 #### Scenario: Terminal is restored on every exit path
 
 - **WHEN** the dialog exits by any closing key or by error
-- **THEN** the saved stty settings and the visible cursor are restored
-  before the process returns
+- **THEN** the terminal state and visible cursor are restored before the
+  process returns
 
-### Requirement: The dialog frame layout matches herdr-open-in
+### Requirement: The dialog frame keeps the content compact and the footer visible
 
-The dialog SHALL draw the herdr-open-in dialog shape: no internal title
-line, one blank line above the rows, the help footer pinned to the drawable
-bottom, no trailing line break, and a per-frame terminal size re-read.
+The dialog SHALL draw no internal title line, place one blank line above
+the rows, and pin the help footer to the drawable bottom. It SHALL use the
+terminal backend's current frame size for each redraw.
 
 #### Scenario: Frame chrome carries no internal title
 
 - **WHEN** any frame is drawn
 - **THEN** the first content line is a blank line, no title text is
   rendered (the popup window chrome already shows the manifest pane
-  title), and the frame's last byte is the footer padding with no
-  trailing newline
+  title)
 
 #### Scenario: Footer is pinned to the drawable bottom
 
 - **WHEN** the terminal is taller than the chrome plus rows
 - **THEN** filler blank lines push the footer to the bottom-most line and
-  the size is re-read via `stty size` on every redraw, with an 80×24
-  fallback when it cannot be parsed
+  the current frame size is used on every redraw
 
-### Requirement: The dialog runs as a raw-mode popup TUI with theme colors
+### Requirement: The dialog runs as a raw-mode popup TUI with terminal-default colors
 
-The dialog SHALL run a raw-mode TUI entered through an `stty` child
-process, following the herdr-open-in pattern, with colors from a palette
-resolved once from the herdr config theme (`$HERDR_CONFIG_PATH` else
-`~/.config/herdr/config.toml`, built-ins), ANSI-16 fallback on any
-resolution failure.
+The dialog SHALL use a terminal TUI with terminal-default foreground and
+background colors and basic text attributes. It SHALL NOT read or parse
+the herdr theme configuration. When stdin is non-interactive, it SHALL
+print the same guidance as plain text and read one byte before exiting.
 
-#### Scenario: Frame colors follow the herdr theme palette
+#### Scenario: Dialog uses terminal-default colors without reading the herdr theme
 
-- **WHEN** the dialog starts with a herdr config naming a built-in theme
-- **THEN** the painted tokens (panel background, text, overlay1) come from
-  that theme, and an unset, unreadable, invalid, or unknown theme name
-  selects the ANSI-16 fallback
+- **WHEN** the dialog starts under any terminal palette or light/dark mode
+- **THEN** it uses terminal-default colors and basic text attributes without
+  reading or parsing the herdr theme configuration

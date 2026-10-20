@@ -1,15 +1,17 @@
 //! herdr plugin that runs a review tool and delivers its annotations.
 
 mod adapters;
-mod config;
 mod features;
+mod settings;
 
 fn main() {
     if let Err(e) = run() {
         eprintln!("herdr-review: {e}");
         // Plugin panes auto-close when this process exits, so pane-mode errors
         // must block until the user has read the message.
-        if env_set("HERDR_PLUGIN_ENTRYPOINT_ID") {
+        if env_set("HERDR_PLUGIN_ENTRYPOINT_ID")
+            && env_value("HERDR_REVIEWS_INTERNAL_MODE").as_deref() != Some("focus-after-picker")
+        {
             features::review::hold_pane();
         }
         std::process::exit(1);
@@ -23,6 +25,10 @@ enum RunMode {
     Review,
     /// `HERDR_PLUGIN_ENTRYPOINT_ID=setup`: the read-only setup dialog popup.
     Setup,
+    /// `HERDR_PLUGIN_ENTRYPOINT_ID=picker`: the installed-tool picker popup.
+    Picker,
+    /// Detached helper that closes the picker popup and re-focuses the review tab.
+    PickerFocus,
     /// Only `HERDR_PLUGIN_ACTION_ID` is set: the action.
     Action,
     /// Neither is set: invoked outside herdr.
@@ -35,12 +41,16 @@ enum RunMode {
 /// unset, so herdr passing empty strings never silently selects a mode. Any
 /// other non-blank value is an error naming it.
 fn run_mode() -> Result<RunMode, String> {
+    if env_value("HERDR_REVIEWS_INTERNAL_MODE").as_deref() == Some("focus-after-picker") {
+        return Ok(RunMode::PickerFocus);
+    }
     match env_value("HERDR_PLUGIN_ENTRYPOINT_ID") {
         Some(id) => match id.as_str() {
             "review" => Ok(RunMode::Review),
             "setup" => Ok(RunMode::Setup),
+            "picker" => Ok(RunMode::Picker),
             other => Err(format!(
-                "unknown plugin entrypoint {other}; expected review or setup"
+                "unknown plugin entrypoint {other}; expected review, setup, or picker"
             )),
         },
         None if env_set("HERDR_PLUGIN_ACTION_ID") => Ok(RunMode::Action),
@@ -52,6 +62,8 @@ fn run() -> Result<(), String> {
     match run_mode()? {
         RunMode::Review => features::review::run_pane(),
         RunMode::Setup => features::setup::SetupDialog::run(),
+        RunMode::Picker => features::picker::run(),
+        RunMode::PickerFocus => features::picker::focus_after_popup(),
         RunMode::Action => features::review::run_action(),
         RunMode::Outside => Err("invoked outside herdr plugin context".to_string()),
     }
@@ -84,6 +96,7 @@ mod tests {
         _lock: std::sync::MutexGuard<'static, ()>,
         prev_entry: Option<OsString>,
         prev_action: Option<OsString>,
+        prev_internal: Option<OsString>,
     }
 
     impl ModeEnv {
@@ -91,12 +104,15 @@ mod tests {
             let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev_entry = std::env::var_os("HERDR_PLUGIN_ENTRYPOINT_ID");
             let prev_action = std::env::var_os("HERDR_PLUGIN_ACTION_ID");
+            let prev_internal = std::env::var_os("HERDR_REVIEWS_INTERNAL_MODE");
             set_var("HERDR_PLUGIN_ENTRYPOINT_ID", entry);
             set_var("HERDR_PLUGIN_ACTION_ID", action);
+            set_var("HERDR_REVIEWS_INTERNAL_MODE", None);
             Self {
                 _lock: lock,
                 prev_entry,
                 prev_action,
+                prev_internal,
             }
         }
     }
@@ -110,6 +126,10 @@ mod tests {
             match &self.prev_action {
                 Some(v) => unsafe { std::env::set_var("HERDR_PLUGIN_ACTION_ID", v) },
                 None => unsafe { std::env::remove_var("HERDR_PLUGIN_ACTION_ID") },
+            }
+            match &self.prev_internal {
+                Some(v) => unsafe { std::env::set_var("HERDR_REVIEWS_INTERNAL_MODE", v) },
+                None => unsafe { std::env::remove_var("HERDR_REVIEWS_INTERNAL_MODE") },
             }
         }
     }
@@ -143,7 +163,7 @@ mod tests {
             let err = run_mode().unwrap_err();
             assert_eq!(
                 err,
-                "unknown plugin entrypoint editor; expected review or setup"
+                "unknown plugin entrypoint editor; expected review, setup, or picker"
             );
         }
     }
@@ -172,6 +192,15 @@ mod tests {
     fn action_only_is_action() {
         let _env = ModeEnv::set(None, Some("review"));
         assert_eq!(run_mode().unwrap(), RunMode::Action);
+    }
+
+    #[test]
+    fn detached_picker_focus_helper_dispatches_before_pane_mode() {
+        let _env = ModeEnv::set(Some("picker"), Some("open"));
+        unsafe {
+            std::env::set_var("HERDR_REVIEWS_INTERNAL_MODE", "focus-after-picker");
+        }
+        assert_eq!(run_mode().unwrap(), RunMode::PickerFocus);
     }
 
     #[test]
@@ -220,7 +249,7 @@ mod tests {
         let actions = manifest.get("actions").and_then(|v| v.as_array()).unwrap();
         let panes = manifest.get("panes").and_then(|v| v.as_array()).unwrap();
         assert_eq!(actions.len(), 1);
-        assert_eq!(panes.len(), 2);
+        assert_eq!(panes.len(), 3);
         assert_eq!(actions[0].get("id").and_then(|v| v.as_str()), Some("open"));
         assert_eq!(
             actions[0].get("contexts").and_then(|v| v.as_array()),
@@ -241,6 +270,7 @@ mod tests {
         }
         let review = &panes[0];
         let setup = &panes[1];
+        let picker = &panes[2];
         assert_eq!(review.get("id").and_then(|v| v.as_str()), Some("review"));
         assert_eq!(
             review.get("placement").and_then(|v| v.as_str()),
@@ -257,5 +287,11 @@ mod tests {
         );
         assert_eq!(setup.get("width").and_then(|v| v.as_str()), Some("60%"));
         assert_eq!(setup.get("height").and_then(|v| v.as_integer()), Some(15));
+        assert_eq!(picker.get("id").and_then(|v| v.as_str()), Some("picker"));
+        assert_eq!(
+            picker.get("placement").and_then(|v| v.as_str()),
+            Some("popup")
+        );
+        assert_eq!(picker.get("width").and_then(|v| v.as_integer()), Some(38));
     }
 }
