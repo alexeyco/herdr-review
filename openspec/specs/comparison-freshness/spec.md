@@ -1,4 +1,4 @@
-# comparison-freshness Specification
+# Comparison Freshness
 
 ## Purpose
 
