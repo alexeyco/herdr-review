@@ -17,16 +17,27 @@
 //! `REVIEW_MAX_AGE` are pruned best-effort at pane start.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::adapters::git::{GitRepository, Scope};
+use crate::adapters::herdr;
+use crate::adapters::tool::{self, ReviewTool};
+use crate::adapters::tuicr;
 use crate::config;
-use crate::context;
-use crate::convert;
-use crate::git::{self, Scope};
-use crate::herdr;
-use crate::tool::{self, Tool};
-use crate::tuicr;
+
+pub(crate) mod annotations;
+mod context;
+mod outcome;
+pub(crate) mod ports;
+mod process;
+
+use self::annotations as convert;
+
+use outcome::{Outcome, decide, prompt_text};
+use ports::{OpenReview, ReviewActionHost, ReviewDeliveryHost, ReviewRepository, ReviewToolRunner};
+use process::{ChildProcess, ChildResult, child_argv};
+#[cfg(test)]
+use process::{captures_stdout, revdiff_argv, spawn_child};
 
 /// Printed before blocking on stdin so an auto-closing plugin pane stays open
 /// on error and no-agent paths.
@@ -36,49 +47,6 @@ const REVIEW_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Cap on the delivered agent prompt, well under ARG_MAX (1 MiB macOS / 2 MiB
 /// Linux): annotations travel as a single argv element.
 const MAX_PROMPT_BYTES: usize = 65536;
-
-/// What to do with the tool's result.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Outcome {
-    /// Annotations exist and an agent target is available.
-    Deliver,
-    /// The tool quit cleanly with nothing to report.
-    NoAnnotations,
-    /// Annotations exist, but no agent to send them to.
-    NoAgent,
-    /// The tool exited with an error; the output is kept.
-    Failed(i32),
-}
-
-/// Decides the outcome from the tool's exit code, its collection channel, and
-/// agent availability. `annotations` is the per-tool "annotations exist"
-/// signal: revdiff exits 10 or exits 0 with non-blank `.out` content, tuicr
-/// exits 0 with a non-empty comment list, lumen exits 0 with non-blank
-/// captured stdout. Any exit code outside the tool's success set is
-/// `Failed(rc)` regardless of collected output.
-pub(crate) fn decide(tool_id: &str, rc: i32, annotations: bool, has_agent: bool) -> Outcome {
-    // revdiff's success set also includes its annotations code 10; every
-    // other tool's is 0 only.
-    let success = rc == 0 || (tool_id == "revdiff" && rc == 10);
-    if !success {
-        return Outcome::Failed(rc);
-    }
-    if annotations {
-        if has_agent {
-            Outcome::Deliver
-        } else {
-            Outcome::NoAgent
-        }
-    } else {
-        Outcome::NoAnnotations
-    }
-}
-
-/// Prompt text sent to the agent: the tool-named header plus the trimmed
-/// canonical annotation text.
-pub(crate) fn prompt_text(tool_id: &str, output: &str) -> String {
-    format!("Review annotations from {tool_id}:\n\n{}", output.trim())
-}
 
 /// Caps the delivered prompt at `max_bytes`, cutting on a UTF-8 boundary and
 /// appending a note pointing at the kept output file when truncation happens.
@@ -99,139 +67,9 @@ fn cap_prompt(text: &str, max_bytes: usize, kept_path: &Path) -> String {
     capped
 }
 
-/// Full argv for the review-tool child, per the spawn matrix: revdiff takes
-/// its scope fragments around the fixed trailing flags, tuicr its fragment
-/// alone, lumen the `diff` subcommand plus its fragment.
-fn child_argv(tool_id: &str, bin: &str, out_path: &str, scope: &Scope) -> Vec<String> {
-    match tool_id {
-        "revdiff" => revdiff_argv(bin, out_path, scope),
-        "tuicr" => {
-            let mut argv = vec![bin.to_string()];
-            argv.extend(scope.fragments("tuicr"));
-            argv
-        }
-        "lumen" => {
-            let mut argv = vec![bin.to_string(), "diff".to_string()];
-            argv.extend(scope.fragments("lumen"));
-            argv
-        }
-        _ => unreachable!("tool ids come from the catalog"),
-    }
-}
-
-/// Full argv for the revdiff child: binary, the scope's flag fragments, the
-/// fixed trailing `--output <out> --exit-code-on-annotations`, and the
-/// scope's positional refs last so both strict and lenient parsers accept
-/// them.
-fn revdiff_argv(bin: &str, out_path: &str, scope: &Scope) -> Vec<String> {
-    let fragments = scope.fragments("revdiff");
-    // `Uncommitted`'s fragment is the `--untracked` flag, which goes before
-    // the fixed trailing flags; `VsBase`'s are the two positional refs, which
-    // go after them.
-    let (leading, trailing): (&[String], &[String]) = match scope {
-        Scope::Uncommitted => (&fragments, &[]),
-        Scope::VsBase(_) | Scope::NothingToReview => (&[], &fragments),
-    };
-    let mut argv = vec![bin.to_string()];
-    argv.extend(leading.iter().cloned());
-    argv.push("--output".to_string());
-    argv.push(out_path.to_string());
-    argv.push("--exit-code-on-annotations".to_string());
-    argv.extend(trailing.iter().cloned());
-    argv
-}
-
-/// The stdio strategy for one child stream.
-#[derive(Debug, PartialEq, Eq)]
-enum StreamPlan {
-    /// The child inherits the pane tty.
-    Inherit,
-    /// The child's stream is a pipe the pane process reads to completion.
-    Piped,
-}
-
-/// The per-tool stdio plan: lumen's stdout is piped — its annotation export is
-/// captured while the TUI renders to `/dev/tty` itself — and its stderr
-/// inherits the pane tty; revdiff and tuicr inherit both streams.
-fn stdio_plan(tool_id: &str) -> (StreamPlan, StreamPlan) {
-    match tool_id {
-        "lumen" => (StreamPlan::Piped, StreamPlan::Inherit),
-        _ => (StreamPlan::Inherit, StreamPlan::Inherit),
-    }
-}
-
-/// The review-tool child's result: its exit code (absent when the child was
-/// killed) and, for lumen, the captured stdout.
-#[derive(Debug, Default)]
-struct ChildResult {
-    code: Option<i32>,
-    stdout: String,
-}
-
-/// Spawns the resolved binary as a direct child in `dir` with the tool's
-/// stdio strategy and waits for it to exit. A spawn failure (for example the
-/// binary was removed between resolution and spawn) is the hard error
-/// `failed to run <bin> in <dir>: <error>`.
-///
-/// On Linux a freshly written executable can transiently fail `exec` with
-/// `ETXTBSY` (Text file busy) while the kernel still sees a write reference,
-/// so that one error is retried a bounded number of times; every other spawn
-/// failure is returned immediately.
-fn spawn_child(tool_id: &str, argv: &[String], dir: &Path) -> Result<ChildResult, String> {
-    #[cfg(unix)]
-    const ETXTBSY: i32 = 26;
-    #[cfg(not(unix))]
-    const ETXTBSY: i32 = -1;
-    const ETXTBSY_RETRIES: u32 = 5;
-
-    let piped = stdio_plan(tool_id).0 == StreamPlan::Piped;
-    let mut child = {
-        let mut attempt = 0;
-        loop {
-            let mut cmd = Command::new(&argv[0]);
-            cmd.args(&argv[1..]).current_dir(dir);
-            if piped {
-                // Piped stdout, inherited stderr: the pipe is drained to
-                // completion while the child runs, so a large export cannot
-                // deadlock.
-                cmd.stdout(Stdio::piped());
-            }
-            match cmd.spawn() {
-                Ok(child) => break child,
-                Err(e) if e.raw_os_error() == Some(ETXTBSY) && attempt < ETXTBSY_RETRIES => {
-                    attempt += 1;
-                    std::thread::sleep(Duration::from_millis(20 * u64::from(attempt)));
-                }
-                Err(e) => return Err(spawn_error(&e, argv, dir)),
-            }
-        }
-    };
-    if piped {
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("failed to wait for {}: {e}", argv[0]))?;
-        Ok(ChildResult {
-            code: output.status.code(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        })
-    } else {
-        let status = child
-            .wait()
-            .map_err(|e| format!("failed to wait for {}: {e}", argv[0]))?;
-        Ok(ChildResult {
-            code: status.code(),
-            stdout: String::new(),
-        })
-    }
-}
-
-fn spawn_error(e: &std::io::Error, argv: &[String], dir: &Path) -> String {
-    format!("failed to run {} in {}: {e}", argv[0], dir.display())
-}
-
 /// Everything the collection stage needs about one review run.
-struct PaneRun<'a> {
-    tool: &'a Tool,
+struct ReviewSession<'a> {
+    tool: ReviewTool,
     bin: &'a str,
     dir: &'a Path,
     out_path: &'a Path,
@@ -245,6 +83,66 @@ struct PaneRun<'a> {
     caller_tab: Option<&'a str>,
 }
 
+type PaneRun<'a> = ReviewSession<'a>;
+
+impl ReviewSession<'_> {
+    fn collect_and_finish(&self, child: &ChildResult) -> Result<(), String> {
+        self.collect_and_finish_with(child, &real_teardown())
+    }
+
+    fn collect_and_finish_with(
+        &self,
+        child: &ChildResult,
+        teardown: &dyn ReviewDeliveryHost,
+    ) -> Result<(), String> {
+        let tool = self.tool;
+        let Some(rc) = child.code else {
+            if tool == ReviewTool::Lumen {
+                keep_raw(self.out_path, &child.stdout);
+            }
+            return Err(format!(
+                "{} terminated without an exit code (killed?); output kept at {}",
+                tool.id(),
+                self.out_path.display()
+            ));
+        };
+        match tool {
+            ReviewTool::Revdiff => {
+                let output = read_output(rc, self.out_path)?;
+                let annotations = rc == 10 || (rc == 0 && !output.trim().is_empty());
+                finish(self, rc, annotations, &output, teardown)
+            }
+            ReviewTool::Tuicr => {
+                if rc != 0 {
+                    return finish(self, rc, false, "", teardown);
+                }
+                let comments = tuicr::TuicrClient::new(self.bin, self.dir)
+                    .collect_comments(self.launched_at)
+                    .map_err(|detail| {
+                        format!(
+                            "tuicr session lookup failed: {detail}; output kept at {}",
+                            self.out_path.display()
+                        )
+                    })?;
+                let canonical = convert::tuicr_to_canonical(&comments);
+                write_output(self.out_path, &canonical)?;
+                finish(self, rc, !comments.is_empty(), &canonical, teardown)
+            }
+            ReviewTool::Lumen => {
+                if rc != 0 {
+                    keep_raw(self.out_path, &child.stdout);
+                    return finish(self, rc, false, "", teardown);
+                }
+                let canonical = collect_lumen_output(&child.stdout, self.out_path)?;
+                let annotations = !convert::strip_terminal_escapes(&child.stdout)
+                    .trim()
+                    .is_empty();
+                finish(self, rc, annotations, &canonical, teardown)
+            }
+        }
+    }
+}
+
 /// Action mode: parse the context, resolve the caller identity, read the
 /// config once, then decide — the configured tool detected on `PATH` opens
 /// the review pane directly, anything else (unset, blank, invalid and
@@ -255,7 +153,7 @@ pub(crate) fn run_action() -> Result<(), String> {
     let json = env_non_blank("HERDR_PLUGIN_CONTEXT_JSON").ok_or_else(|| {
         "HERDR_PLUGIN_CONTEXT_JSON is not set; invoke this action from herdr".to_string()
     })?;
-    let ctx = context::parse(&json)?;
+    let ctx = context::Context::parse(&json)?;
     let identity = CallerIdentity::resolve(
         &ctx,
         env_non_blank("HERDR_WORKSPACE_ID").as_deref(),
@@ -340,7 +238,8 @@ type OpenFn<'a> = &'a dyn for<'c> Fn(
     Option<&str>,
 ) -> Result<Option<herdr::PaneIds>, String>;
 
-/// The process-bound steps of the action flow, injected so tests script them.
+/// Boundary required by the action workflow.
+/// Closure-backed adapter; tests use it to replace external calls.
 struct ActionDeps<'a> {
     load_config: &'a dyn Fn() -> crate::config::Config,
     open: OpenFn<'a>,
@@ -350,6 +249,40 @@ struct ActionDeps<'a> {
     warn: &'a dyn Fn(&str),
 }
 
+impl ReviewActionHost for ActionDeps<'_> {
+    fn load_config(&self) -> crate::config::Config {
+        (self.load_config)()
+    }
+
+    fn open_review(&self, request: OpenReview<'_>) -> Result<Option<herdr::PaneIds>, String> {
+        (self.open)(
+            request.config,
+            request.dir,
+            request.tool_id,
+            request.workspace,
+            request.caller_pane,
+            request.caller_agent,
+            request.caller_tab,
+        )
+    }
+
+    fn open_setup(&self) -> Result<(), String> {
+        (self.open_setup)()
+    }
+
+    fn focus(&self, tab_id: &str) -> Result<(), String> {
+        (self.focus)(tab_id)
+    }
+
+    fn log(&self, message: &str) {
+        (self.log)(message);
+    }
+
+    fn warn(&self, message: &str) {
+        (self.warn)(message);
+    }
+}
+
 /// The action's decision flow over the resolved identity, the review
 /// directory, the `PATH` the tool detection runs on, and the process seams.
 /// Requirement: "The action decides between the direct open and the setup dialog".
@@ -357,63 +290,86 @@ fn run_action_with(
     identity: &CallerIdentity,
     dir: &str,
     path: &str,
-    deps: &ActionDeps,
+    deps: &dyn ReviewActionHost,
 ) -> Result<(), String> {
-    let config = (deps.load_config)();
-    // The main path: a valid configured tool id whose binary is detected on
-    // `PATH` with the catalog's detection rules. Anything else routes the
-    // launch to the setup dialog, and no review pane is opened.
-    let Some(tool) = config
-        .tool
-        .filter(|tool| tool::installed(path).contains(tool))
-    else {
-        (deps.open_setup)()?;
-        (deps.log)("herdr-review: opened review tool setup");
-        return Ok(());
-    };
-    let mut config = config;
-    // The herdr 0.9.5 daemon rejects targetless split/zoomed opens with
-    // `invalid_params`; without a caller pane those placements degrade to
-    // tab — which still opens the pane — with one warning naming the
-    // degraded knob, consistent with the never-fatal config layer.
-    if matches!(
-        config.placement,
-        config::Placement::Split | config::Placement::Zoomed
-    ) && identity.pane.is_none()
-    {
-        (deps.warn)(&format!(
-            "placement \"{}\" needs a caller pane; using \"tab\"",
-            config.placement.as_str()
-        ));
-        config.placement = config::Placement::Tab;
-    }
-    let ids = (deps.open)(
-        &config,
+    ReviewAction {
+        identity,
         dir,
-        tool.id,
-        identity.workspace.as_deref(),
-        identity.pane.as_deref(),
-        identity.agent.as_deref(),
-        identity.tab.as_deref(),
-    )?;
-    // An unparsable reply already warned; exit status 0 means the pane
-    // exists, so the launch still succeeds without the log line.
-    if let Some(ids) = ids {
-        match &ids.tab_id {
-            Some(tab) => {
-                (deps.log)(&format!(
-                    "herdr-review: opened review pane {} in tab {}",
-                    ids.pane_id, tab
-                ));
-                // Defensive: re-assert focus best-effort against a
-                // client-side rendering race; herdr already applies `--focus`
-                // at open.
-                let _ = (deps.focus)(tab);
-            }
-            None => (deps.log)(&format!("herdr-review: opened review pane {}", ids.pane_id)),
-        }
+        path,
+        deps,
     }
-    Ok(())
+    .run()
+}
+
+struct ReviewAction<'a> {
+    identity: &'a CallerIdentity,
+    dir: &'a str,
+    path: &'a str,
+    deps: &'a dyn ReviewActionHost,
+}
+
+impl ReviewAction<'_> {
+    fn run(&self) -> Result<(), String> {
+        let identity = self.identity;
+        let dir = self.dir;
+        let path = self.path;
+        let deps = self.deps;
+        let config = deps.load_config();
+        // The main path: a valid configured tool id whose binary is detected on
+        // `PATH` with the catalog's detection rules. Anything else routes the
+        // launch to the setup dialog, and no review pane is opened.
+        let Some(tool) = config
+            .tool
+            .filter(|tool| tool::installed(path).contains(tool))
+        else {
+            deps.open_setup()?;
+            deps.log("herdr-review: opened review tool setup");
+            return Ok(());
+        };
+        let mut config = config;
+        // The herdr 0.9.5 daemon rejects targetless split/zoomed opens with
+        // `invalid_params`; without a caller pane those placements degrade to
+        // tab — which still opens the pane — with one warning naming the
+        // degraded knob, consistent with the never-fatal config layer.
+        if matches!(
+            config.placement,
+            config::Placement::Split | config::Placement::Zoomed
+        ) && identity.pane.is_none()
+        {
+            deps.warn(&format!(
+                "placement \"{}\" needs a caller pane; using \"tab\"",
+                config.placement.as_str()
+            ));
+            config.placement = config::Placement::Tab;
+        }
+        let ids = deps.open_review(OpenReview {
+            config: &config,
+            dir,
+            tool_id: tool.id(),
+            workspace: identity.workspace.as_deref(),
+            caller_pane: identity.pane.as_deref(),
+            caller_agent: identity.agent.as_deref(),
+            caller_tab: identity.tab.as_deref(),
+        })?;
+        // An unparsable reply already warned; exit status 0 means the pane
+        // exists, so the launch still succeeds without the log line.
+        if let Some(ids) = ids {
+            match &ids.tab_id {
+                Some(tab) => {
+                    deps.log(&format!(
+                        "herdr-review: opened review pane {} in tab {}",
+                        ids.pane_id, tab
+                    ));
+                    // Defensive: re-assert focus best-effort against a
+                    // client-side rendering race; herdr already applies `--focus`
+                    // at open.
+                    let _ = deps.focus(tab);
+                }
+                None => deps.log(&format!("herdr-review: opened review pane {}", ids.pane_id)),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Review-pane mode: probe git read-only, announce the scope, spawn the chosen
@@ -431,126 +387,93 @@ pub(crate) fn run_pane() -> Result<(), String> {
     };
     // The tool selection precedes any git probe or spawn.
     let tool = tool::selected()?;
+    let repository = GitRepository::new(&dir);
+    ReviewPane {
+        repository: &repository,
+        runner: &ChildProcess,
+    }
+    .run(&dir, tool)
+}
 
-    let scope = git::select_scope(&git::probe(&dir));
-    match &scope {
-        // A failed probe already printed its warning; either way no tool runs
-        // and no output file is created — hold the pane and exit cleanly.
-        Scope::NothingToReview => {
-            println!("herdr-review: nothing to review");
-            hold_pane();
-            return Ok(());
+struct ReviewPane<'a> {
+    repository: &'a dyn ReviewRepository,
+    runner: &'a dyn ReviewToolRunner,
+}
+
+impl ReviewPane<'_> {
+    fn run(&self, dir: &Path, tool: ReviewTool) -> Result<(), String> {
+        let reports = state_dir().join("reviews");
+        self.run_in(dir, tool, &reports, || tool::resolve(tool))
+    }
+
+    fn run_in(
+        &self,
+        dir: &Path,
+        tool: ReviewTool,
+        reports: &Path,
+        resolve_bin: impl FnOnce() -> Result<String, String>,
+    ) -> Result<(), String> {
+        let scope = self.repository.scope();
+        match &scope {
+            // A failed probe already printed its warning; either way no tool runs
+            // and no output file is created — hold the pane and exit cleanly.
+            Scope::NothingToReview => {
+                println!("herdr-review: nothing to review");
+                hold_pane();
+                return Ok(());
+            }
+            Scope::Uncommitted => println!("herdr-review: reviewing uncommitted changes"),
+            Scope::VsBase(base) => println!("herdr-review: reviewing vs {base}"),
         }
-        Scope::Uncommitted => println!("herdr-review: reviewing uncommitted changes"),
-        Scope::VsBase(base) => println!("herdr-review: reviewing vs {base}"),
-    }
 
-    let reports = state_dir().join("reviews");
-    ensure_state_dir(&reports)?;
-    prune_old_reviews(&reports, SystemTime::now());
-    let out_path = reports.join(state_file_name(std::process::id(), unix_millis()?));
-    // revdiff writes the file itself; for tuicr and lumen the plugin owns the
-    // content, so an empty file exists before the spawn and failure paths
-    // keep evidence on disk.
-    if tool.id != "revdiff" {
-        write_output(&out_path, "")?;
+        ensure_state_dir(reports)?;
+        prune_old_reviews(reports, SystemTime::now());
+        let out_path = reports.join(state_file_name(std::process::id(), unix_millis()?));
+        // revdiff writes the file itself; for tuicr and lumen the plugin owns the
+        // content, so an empty file exists before the spawn and failure paths
+        // keep evidence on disk.
+        if tool != ReviewTool::Revdiff {
+            write_output(&out_path, "")?;
+        }
+        let bin = resolve_bin()?;
+        let argv = child_argv(tool, &bin, &out_path.to_string_lossy(), &scope);
+        let caller_pane = env_non_blank("HERDR_REVIEWS_CALLER_PANE");
+        let caller_agent = env_non_blank("HERDR_REVIEWS_CALLER_AGENT");
+        let caller_tab = env_non_blank("HERDR_REVIEWS_CALLER_TAB");
+        // The launch timestamp precedes the spawn so the tuicr adapter can tell
+        // this run's sessions from older ones.
+        let run = ReviewSession {
+            tool,
+            bin: &bin,
+            dir,
+            out_path: &out_path,
+            launched_at: SystemTime::now(),
+            caller_pane: caller_pane.as_deref(),
+            caller_agent: caller_agent.as_deref(),
+            caller_tab: caller_tab.as_deref(),
+        };
+        let child = self.runner.run(tool, &argv, dir)?;
+        run.collect_and_finish(&child)
     }
-    let bin = tool::resolve(tool)?;
-    let argv = child_argv(tool.id, &bin, &out_path.to_string_lossy(), &scope);
-    let caller_pane = env_non_blank("HERDR_REVIEWS_CALLER_PANE");
-    let caller_agent = env_non_blank("HERDR_REVIEWS_CALLER_AGENT");
-    let caller_tab = env_non_blank("HERDR_REVIEWS_CALLER_TAB");
-    // The launch timestamp precedes the spawn so the tuicr adapter can tell
-    // this run's sessions from older ones.
-    let run = PaneRun {
-        tool,
-        bin: &bin,
-        dir: &dir,
-        out_path: &out_path,
-        launched_at: SystemTime::now(),
-        caller_pane: caller_pane.as_deref(),
-        caller_agent: caller_agent.as_deref(),
-        caller_tab: caller_tab.as_deref(),
-    };
-    let child = spawn_child(tool.id, &argv, &dir)?;
-    collect_and_finish(&run, &child)
 }
 
 /// Per-tool collection and outcome: reads revdiff's output file, runs the
 /// tuicr session adapter, converts lumen's captured stdout, and maps each to
 /// the delivery decision.
+#[cfg(test)]
 fn collect_and_finish(run: &PaneRun, child: &ChildResult) -> Result<(), String> {
-    collect_and_finish_with(run, child, &real_teardown())
+    run.collect_and_finish(child)
 }
 
 /// [`collect_and_finish`] with the process-bound herdr calls injected, so
 /// the clean-ending teardown is testable without the environment.
+#[cfg(test)]
 fn collect_and_finish_with(
     run: &PaneRun,
     child: &ChildResult,
-    teardown: &Teardown,
+    teardown: &dyn ReviewDeliveryHost,
 ) -> Result<(), String> {
-    let tool = run.tool;
-    let Some(rc) = child.code else {
-        // No exit code means the child was killed; lumen's partial capture is
-        // kept, the other tools' files are already on disk. The run fails
-        // with the killed message and the output file is kept.
-        if tool.id == "lumen" {
-            keep_raw(run.out_path, &child.stdout);
-        }
-        return Err(format!(
-            "{} terminated without an exit code (killed?); output kept at {}",
-            tool.id,
-            run.out_path.display()
-        ));
-    };
-    match tool.id {
-        "revdiff" => {
-            let output = read_output(rc, run.out_path)?;
-            let annotations = rc == 10 || (rc == 0 && !output.trim().is_empty());
-            finish(run, rc, annotations, &output, teardown)
-        }
-        "tuicr" => {
-            if rc != 0 {
-                // No adapter command runs on a nonzero exit; the (empty)
-                // output file is kept and the run fails with the code.
-                return finish(run, rc, false, "", teardown);
-            }
-            let comments = tuicr::collect_comments(
-                run.dir,
-                run.launched_at,
-                &|args| tuicr::exec_tuicr(run.bin, run.dir, args),
-                &|args| tuicr::exec_git(run.dir, args),
-            )
-            .map_err(|detail| {
-                format!(
-                    "tuicr session lookup failed: {detail}; output kept at {}",
-                    run.out_path.display()
-                )
-            })?;
-            let canonical = convert::tuicr_to_canonical(&comments);
-            write_output(run.out_path, &canonical)?;
-            finish(run, rc, !comments.is_empty(), &canonical, teardown)
-        }
-        "lumen" => {
-            if rc != 0 {
-                // Whatever was captured is written best-effort and the run
-                // fails with the code.
-                keep_raw(run.out_path, &child.stdout);
-                return finish(run, rc, false, "", teardown);
-            }
-            let canonical = collect_lumen_output(&child.stdout, run.out_path)?;
-            // The annotations signal runs on the escape-stripped remainder,
-            // matching the collection's blank check: lumen emits terminal
-            // probes to stdout even when closed without exporting
-            // (live-observed), so raw bytes alone never make annotations.
-            let annotations = !convert::strip_terminal_escapes(&child.stdout)
-                .trim()
-                .is_empty();
-            finish(run, rc, annotations, &canonical, teardown)
-        }
-        _ => unreachable!("tool ids come from the catalog"),
-    }
+    run.collect_and_finish_with(child, teardown)
 }
 
 /// Reads revdiff's output file. A missing or unreadable file is only harmless
@@ -627,23 +550,19 @@ fn finish(
     rc: i32,
     annotations: bool,
     output: &str,
-    teardown: &Teardown,
+    teardown: &dyn ReviewDeliveryHost,
 ) -> Result<(), String> {
     let tool = run.tool;
     let has_agent = run.caller_pane.is_some() && run.caller_agent.is_some();
-    match decide(tool.id, rc, annotations, has_agent) {
+    match decide(tool, rc, annotations, has_agent) {
         Outcome::Deliver => {
             // `decide` returns Deliver only when both caller pane and agent are
             // present, so the pane is always Some here; avoid expect() anyway.
             let Some(target) = run.caller_pane else {
                 return Err("internal: deliver outcome without a caller pane".to_string());
             };
-            let prompt = cap_prompt(
-                &prompt_text(tool.id, output),
-                MAX_PROMPT_BYTES,
-                run.out_path,
-            );
-            match (teardown.deliver)(target, &prompt) {
+            let prompt = cap_prompt(&prompt_text(tool, output), MAX_PROMPT_BYTES, run.out_path);
+            match teardown.deliver(target, &prompt) {
                 Ok(()) => {
                     eprintln!("herdr-review: sent review annotations to agent pane {target}");
                     remove(run.out_path);
@@ -651,7 +570,7 @@ fn finish(
                     // at the moment it closes its own pane, so a post-close
                     // focus call never runs (live herdr 0.9.5 finding).
                     refocus_caller_tab(run.caller_tab, teardown);
-                    (teardown.close)();
+                    teardown.close();
                     Ok(())
                 }
                 Err(e) => Err(format!(
@@ -665,7 +584,7 @@ fn finish(
             remove(run.out_path);
             // Same focus-before-close ordering as the delivered leg.
             refocus_caller_tab(run.caller_tab, teardown);
-            (teardown.close)();
+            teardown.close();
             Ok(())
         }
         Outcome::NoAgent => {
@@ -673,12 +592,12 @@ fn finish(
                 "herdr-review: no agent in focused pane; annotations kept at {}",
                 run.out_path.display()
             );
-            (teardown.hold)();
+            teardown.hold();
             Ok(())
         }
         Outcome::Failed(code) => Err(format!(
             "{} failed with exit code {code}; output kept at {}",
-            tool.id,
+            tool.id(),
             run.out_path.display()
         )),
     }
@@ -699,6 +618,28 @@ struct Teardown<'a> {
     warn: &'a dyn Fn(&str),
     /// The stdin hold for the no-agent and error paths.
     hold: &'a dyn Fn(),
+}
+
+impl ReviewDeliveryHost for Teardown<'_> {
+    fn deliver(&self, pane_id: &str, prompt: &str) -> Result<(), String> {
+        (self.deliver)(pane_id, prompt)
+    }
+
+    fn close(&self) {
+        (self.close)();
+    }
+
+    fn focus(&self, tab_id: &str) -> Result<(), String> {
+        (self.focus)(tab_id)
+    }
+
+    fn warn(&self, message: &str) {
+        (self.warn)(message);
+    }
+
+    fn hold(&self) {
+        (self.hold)();
+    }
 }
 
 /// The production [`Teardown`]: the real herdr calls.
@@ -723,11 +664,11 @@ fn warn_line(msg: &str) {
 /// caller tab skips the call silently. The call runs BEFORE the pane close:
 /// closing its own pane kills the process, so a post-close focus never runs
 /// (live herdr 0.9.5 finding).
-fn refocus_caller_tab(tab: Option<&str>, teardown: &Teardown) {
+fn refocus_caller_tab(tab: Option<&str>, host: &dyn ReviewDeliveryHost) {
     if let Some(tab) = tab
-        && let Err(e) = (teardown.focus)(tab)
+        && let Err(e) = host.focus(tab)
     {
-        (teardown.warn)(&format!("failed to focus caller tab {tab}: {e}"));
+        host.warn(&format!("failed to focus caller tab {tab}: {e}"));
     }
 }
 
@@ -870,34 +811,31 @@ fn env_non_blank(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{Config, Direction, Placement};
+    use ports::{
+        MockReviewActionHost, MockReviewDeliveryHost, MockReviewRepository, MockReviewToolRunner,
+    };
     use std::cell::RefCell;
-    use std::sync::atomic::{AtomicU32, Ordering};
-
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
 
     /// A canonicalized scratch directory, removed when the test ends.
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let unique = format!(
-                "herdr-review-review-test-{tag}-{}-{}",
-                std::process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            );
-            let dir = std::env::temp_dir().join(unique);
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(std::fs::canonicalize(&dir).unwrap())
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("herdr-review-review-test-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
 
         /// Writes an executable stub and returns its path.
         fn stub(&self, name: &str, body: &str) -> PathBuf {
-            let path = self.0.join(name);
+            let path = self.0.path().join(name);
             std::fs::write(&path, body).unwrap();
             #[cfg(unix)]
             {
@@ -905,12 +843,6 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -926,24 +858,30 @@ mod tests {
     fn nonzero_success_code_with_agent_delivers() {
         // Scenario "Nonzero success code with agent delivers": revdiff's
         // annotations code 10 with both caller env vars set.
-        assert_eq!(decide("revdiff", 10, true, true), Outcome::Deliver);
+        assert_eq!(
+            decide(ReviewTool::Revdiff, 10, true, true),
+            Outcome::Deliver
+        );
     }
 
     #[test]
     fn annotations_without_an_agent() {
         // Scenario "Annotations without an agent".
-        for tool in ["revdiff", "tuicr", "lumen"] {
+        for tool in ReviewTool::ALL {
             assert_eq!(decide(tool, 0, true, false), Outcome::NoAgent);
             assert_eq!(decide(tool, 0, true, true), Outcome::Deliver);
         }
-        assert_eq!(decide("revdiff", 10, true, false), Outcome::NoAgent);
+        assert_eq!(
+            decide(ReviewTool::Revdiff, 10, true, false),
+            Outcome::NoAgent
+        );
     }
 
     #[test]
     fn clean_exit_with_blank_output_is_no_annotations() {
         // Scenario "Clean exit with blank output is no-annotations" for all
         // three tools.
-        for tool in ["revdiff", "tuicr", "lumen"] {
+        for tool in ReviewTool::ALL {
             assert_eq!(decide(tool, 0, false, true), Outcome::NoAnnotations);
             assert_eq!(decide(tool, 0, false, false), Outcome::NoAnnotations);
         }
@@ -953,22 +891,28 @@ mod tests {
     fn any_other_exit_code_fails_regardless_of_output() {
         // Scenario "Any other exit code fails regardless of output": revdiff
         // outside {0, 10}, tuicr/lumen nonzero — even with annotations.
-        assert_eq!(decide("revdiff", 1, true, true), Outcome::Failed(1));
-        assert_eq!(decide("revdiff", 2, false, false), Outcome::Failed(2));
-        assert_eq!(decide("tuicr", 1, true, true), Outcome::Failed(1));
-        assert_eq!(decide("lumen", 2, true, true), Outcome::Failed(2));
+        assert_eq!(
+            decide(ReviewTool::Revdiff, 1, true, true),
+            Outcome::Failed(1)
+        );
+        assert_eq!(
+            decide(ReviewTool::Revdiff, 2, false, false),
+            Outcome::Failed(2)
+        );
+        assert_eq!(decide(ReviewTool::Tuicr, 1, true, true), Outcome::Failed(1));
+        assert_eq!(decide(ReviewTool::Lumen, 2, true, true), Outcome::Failed(2));
     }
 
     #[test]
     fn tuicr_with_comments_delivers() {
         // Scenario "tuicr with comments delivers".
-        assert_eq!(decide("tuicr", 0, true, true), Outcome::Deliver);
+        assert_eq!(decide(ReviewTool::Tuicr, 0, true, true), Outcome::Deliver);
     }
 
     #[test]
     fn lumen_export_delivers() {
         // Scenario "lumen export delivers".
-        assert_eq!(decide("lumen", 0, true, true), Outcome::Deliver);
+        assert_eq!(decide(ReviewTool::Lumen, 0, true, true), Outcome::Deliver);
     }
 
     // --- Prompt construction ----------------------------------------------
@@ -977,11 +921,11 @@ mod tests {
     fn header_names_the_tool_that_ran() {
         // Scenario "Header names the tool that ran".
         assert_eq!(
-            prompt_text("tuicr", "## a.rs:1 (+)\nnote\n"),
+            prompt_text(ReviewTool::Tuicr, "## a.rs:1 (+)\nnote\n"),
             "Review annotations from tuicr:\n\n## a.rs:1 (+)\nnote"
         );
         assert_eq!(
-            prompt_text("lumen", "  body  "),
+            prompt_text(ReviewTool::Lumen, "  body  "),
             "Review annotations from lumen:\n\nbody"
         );
     }
@@ -1061,12 +1005,17 @@ mod tests {
     #[test]
     fn child_argv_per_tool() {
         assert_eq!(
-            child_argv("tuicr", "/bin/tuicr", "/s/1.out", &Scope::Uncommitted),
+            child_argv(
+                ReviewTool::Tuicr,
+                "/bin/tuicr",
+                "/s/1.out",
+                &Scope::Uncommitted
+            ),
             ["/bin/tuicr", "-w"]
         );
         assert_eq!(
             child_argv(
-                "tuicr",
+                ReviewTool::Tuicr,
                 "/bin/tuicr",
                 "/s/1.out",
                 &Scope::VsBase("origin/main".to_string())
@@ -1074,12 +1023,17 @@ mod tests {
             ["/bin/tuicr", "-r", "origin/main..HEAD"]
         );
         assert_eq!(
-            child_argv("lumen", "/bin/lumen", "/s/1.out", &Scope::Uncommitted),
+            child_argv(
+                ReviewTool::Lumen,
+                "/bin/lumen",
+                "/s/1.out",
+                &Scope::Uncommitted
+            ),
             ["/bin/lumen", "diff"]
         );
         assert_eq!(
             child_argv(
-                "lumen",
+                ReviewTool::Lumen,
                 "/bin/lumen",
                 "/s/1.out",
                 &Scope::VsBase("origin/main".to_string())
@@ -1089,24 +1043,10 @@ mod tests {
     }
 
     #[test]
-    fn stdio_plan_pipes_only_lumens_stdout() {
-        // Scenarios "tuicr runs on the inherited tty" (stdio plan: both
-        // streams inherit the pane tty) and "lumen stdout is piped while
-        // stderr is inherited" (plan: piped stdout, inherited stderr). The
-        // live-tty behavior is exercised by the spawn tests and the manual
-        // gate; this pins the plan the spawn builder follows.
-        assert_eq!(
-            stdio_plan("tuicr"),
-            (StreamPlan::Inherit, StreamPlan::Inherit)
-        );
-        assert_eq!(
-            stdio_plan("revdiff"),
-            (StreamPlan::Inherit, StreamPlan::Inherit)
-        );
-        assert_eq!(
-            stdio_plan("lumen"),
-            (StreamPlan::Piped, StreamPlan::Inherit)
-        );
+    fn only_lumen_stdout_is_captured() {
+        assert!(!captures_stdout(ReviewTool::Tuicr));
+        assert!(!captures_stdout(ReviewTool::Revdiff));
+        assert!(captures_stdout(ReviewTool::Lumen));
     }
 
     #[test]
@@ -1115,7 +1055,7 @@ mod tests {
         // and spawn.
         let dir = TempDir::new("spawn-fail");
         let argv = vec!["/nonexistent-tool-bin".to_string(), "-w".to_string()];
-        let err = spawn_child("tuicr", &argv, dir.path()).unwrap_err();
+        let err = spawn_child(ReviewTool::Tuicr, &argv, dir.path()).unwrap_err();
         assert!(
             err.contains("failed to run /nonexistent-tool-bin in"),
             "{err}"
@@ -1141,7 +1081,7 @@ mod tests {
             &out.to_string_lossy(),
             &Scope::VsBase("origin/main".to_string()),
         );
-        spawn_child("revdiff", &argv, dir.path()).unwrap();
+        spawn_child(ReviewTool::Revdiff, &argv, dir.path()).unwrap();
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().trim(),
             format!(
@@ -1165,12 +1105,12 @@ mod tests {
             ),
         );
         let argv = child_argv(
-            "tuicr",
+            ReviewTool::Tuicr,
             &bin.to_string_lossy(),
             "/s/1.out",
             &Scope::Uncommitted,
         );
-        let child = spawn_child("tuicr", &argv, dir.path()).unwrap();
+        let child = spawn_child(ReviewTool::Tuicr, &argv, dir.path()).unwrap();
         assert_eq!(child.code, Some(1));
         assert_eq!(std::fs::read_to_string(&log).unwrap().trim(), "-w");
     }
@@ -1186,12 +1126,12 @@ mod tests {
             "#!/bin/sh\nprintf 'export-marker'\nprintf 'stderr-marker' >&2\nexit 1\n",
         );
         let argv = child_argv(
-            "lumen",
+            ReviewTool::Lumen,
             &bin.to_string_lossy(),
             "/s/1.out",
             &Scope::Uncommitted,
         );
-        let child = spawn_child("lumen", &argv, dir.path()).unwrap();
+        let child = spawn_child(ReviewTool::Lumen, &argv, dir.path()).unwrap();
         assert_eq!(child.code, Some(1));
         assert_eq!(child.stdout, "export-marker");
     }
@@ -1211,7 +1151,7 @@ mod tests {
             ),
         );
         let argv = vec![bin.to_string_lossy().into_owned()];
-        let child = spawn_child("revdiff", &argv, dir.path()).unwrap();
+        let child = spawn_child(ReviewTool::Revdiff, &argv, dir.path()).unwrap();
         assert!(child.code.is_none());
         let run = PaneRun {
             tool: tool::by_id("revdiff").unwrap(),
@@ -1363,12 +1303,12 @@ mod tests {
         let out = dir.path().join("1.out");
         let bin = dir.stub("lumen", "#!/bin/sh\nprintf 'partial raw output'\nexit 2\n");
         let argv = child_argv(
-            "lumen",
+            ReviewTool::Lumen,
             &bin.to_string_lossy(),
             "/s/1.out",
             &Scope::Uncommitted,
         );
-        let child = spawn_child("lumen", &argv, dir.path()).unwrap();
+        let child = spawn_child(ReviewTool::Lumen, &argv, dir.path()).unwrap();
         let run = PaneRun {
             tool: tool::by_id("lumen").unwrap(),
             bin: &bin.to_string_lossy(),
@@ -1431,12 +1371,12 @@ mod tests {
             ),
         );
         let argv = child_argv(
-            "tuicr",
+            ReviewTool::Tuicr,
             &bin.to_string_lossy(),
             "/s/1.out",
             &Scope::Uncommitted,
         );
-        let child = spawn_child("tuicr", &argv, dir.path()).unwrap();
+        let child = spawn_child(ReviewTool::Tuicr, &argv, dir.path()).unwrap();
         std::fs::write(&out, "").unwrap();
         let run = PaneRun {
             tool: tool::by_id("tuicr").unwrap(),
@@ -1682,36 +1622,75 @@ mod tests {
     }
 
     #[test]
+    fn pane_uses_repository_and_runner_ports() {
+        let dir = TempDir::new("pane-mocks");
+        let reports = dir.path().join("reviews");
+        let mut repository = MockReviewRepository::new();
+        repository
+            .expect_scope()
+            .times(1)
+            .return_const(Scope::Uncommitted);
+        let mut runner = MockReviewToolRunner::new();
+        runner
+            .expect_run()
+            .withf(|tool, argv, workdir| {
+                *tool == ReviewTool::Tuicr
+                    && argv.first().is_some_and(|bin| bin == "tuicr-bin")
+                    && argv.contains(&"-w".to_string())
+                    && workdir == Path::new("/repo")
+            })
+            .times(1)
+            .returning(|_, _, _| {
+                Ok(ChildResult {
+                    code: Some(1),
+                    stdout: String::new(),
+                })
+            });
+        let pane = ReviewPane {
+            repository: &repository,
+            runner: &runner,
+        };
+        let error = pane
+            .run_in(Path::new("/repo"), ReviewTool::Tuicr, &reports, || {
+                Ok("tuicr-bin".to_string())
+            })
+            .unwrap_err();
+        assert!(error.contains("tuicr failed with exit code 1"), "{error}");
+        assert_eq!(std::fs::read_dir(reports).unwrap().count(), 1);
+    }
+
+    #[test]
     fn delivered_run_refocuses_the_caller_tab() {
         // Scenario "Delivered run refocuses the caller tab": before the pane
         // close attempt the process runs `tab focus <caller tab>` best-effort
         // and exits 0.
         let dir = TempDir::new("focus-deliver");
         let out = dir.path().join("1.out");
-        let calls: RefCell<Vec<String>> = RefCell::new(Vec::new());
+        let mut sequence = mockall::Sequence::new();
+        let mut teardown = MockReviewDeliveryHost::new();
+        teardown
+            .expect_deliver()
+            .withf(|pane, prompt| {
+                pane == "caller-1" && prompt.starts_with("Review annotations from revdiff:")
+            })
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_, _| Ok(()));
+        teardown
+            .expect_focus()
+            .withf(|tab| tab == "w3X:t9")
+            .times(1)
+            .in_sequence(&mut sequence)
+            .returning(|_| Ok(()));
+        teardown
+            .expect_close()
+            .times(1)
+            .in_sequence(&mut sequence)
+            .return_const(());
+        teardown.expect_warn().times(0);
+        teardown.expect_hold().times(0);
         let run = deliver_run(&dir, &out, Some("w3X:t9"));
-        let teardown = Teardown {
-            deliver: &|target, _| {
-                calls.borrow_mut().push(format!("agent prompt {target}"));
-                Ok(())
-            },
-            close: &|| calls.borrow_mut().push("close pane".to_string()),
-            focus: &|tab| {
-                calls.borrow_mut().push(format!("tab focus {tab}"));
-                Ok(())
-            },
-            warn: &|_| panic!("no warning on a clean focus"),
-            hold: &|| panic!("a delivered run never holds"),
-        };
         collect_and_finish_with(&run, &rc_child(10), &teardown).unwrap();
-        assert_eq!(
-            calls.borrow().clone(),
-            [
-                "agent prompt caller-1".to_string(),
-                "tab focus w3X:t9".to_string(),
-                "close pane".to_string(),
-            ]
-        );
         assert!(!out.exists(), "delivery removes the output file");
     }
 
@@ -1906,26 +1885,27 @@ mod tests {
         // opens the review pane — no popup is shown.
         let dir = TempDir::new("action-direct");
         let _bin = dir.stub("revdiff", "#!/bin/sh\nexit 0\n");
-        let opened: RefCell<Vec<String>> = RefCell::new(Vec::new());
-        let deps = ActionDeps {
-            load_config: &|| Config {
-                tool: Some(tool::by_id("revdiff").unwrap()),
-                ..Config::default()
-            },
-            open: &|config, dir, tool_id, workspace, pane, agent, tab| {
-                opened.borrow_mut().push(format!(
-                    "{:?}|{dir}|{tool_id}|{workspace:?}|{pane:?}|{agent:?}|{tab:?}",
-                    config.placement
-                ));
-                // An unparsable reply: the open already succeeded, the log
-                // line is skipped.
-                Ok(None)
-            },
-            open_setup: &|| panic!("a usable configured tool must not open the setup dialog"),
-            focus: &|_| panic!("no focus call on an unparsable reply"),
-            log: &|_| panic!("an unparsable reply already warned and skips the log line"),
-            warn: &|_| panic!("no warning expected"),
-        };
+        let mut deps = MockReviewActionHost::new();
+        deps.expect_load_config().return_const(Config {
+            tool: Some(tool::by_id("revdiff").unwrap()),
+            ..Config::default()
+        });
+        deps.expect_open_review()
+            .withf(|request| {
+                request.config.placement == Placement::Tab
+                    && request.dir == "/repo"
+                    && request.tool_id == "revdiff"
+                    && request.workspace == Some("ws-1")
+                    && request.caller_pane == Some("caller-1")
+                    && request.caller_agent == Some("claude")
+                    && request.caller_tab == Some("caller-tab-1")
+            })
+            .times(1)
+            .returning(|_| Ok(None));
+        deps.expect_open_setup().times(0);
+        deps.expect_focus().times(0);
+        deps.expect_log().times(0);
+        deps.expect_warn().times(0);
         run_action_with(
             &full_identity(),
             "/repo",
@@ -1933,17 +1913,6 @@ mod tests {
             &deps,
         )
         .unwrap();
-        assert_eq!(opened.borrow().len(), 1, "{:?}", opened.borrow());
-        let open = opened.borrow()[0].clone();
-        assert!(open.starts_with("Tab|"), "{open}");
-        assert!(open.contains("|/repo|revdiff|"), "{open}");
-        assert!(open.contains("Some(\"ws-1\")"), "{open}");
-        assert!(open.contains("Some(\"caller-1\")"), "{open}");
-        assert!(open.contains("Some(\"claude\")"), "{open}");
-        // The resolved caller tab travels on the direct open as the
-        // HERDR_REVIEWS_CALLER_TAB pair (argv shape pinned by the herdr
-        // tests).
-        assert!(open.contains("Some(\"caller-tab-1\")"), "{open}");
     }
 
     #[test]

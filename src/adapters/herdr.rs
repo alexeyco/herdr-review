@@ -313,7 +313,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::Mutex;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Serializes tests that mutate `HERDR_BIN_PATH`, restoring the previous
     /// value on drop.
@@ -343,25 +342,21 @@ mod tests {
     }
 
     /// A scratch directory removed when the test ends.
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "herdr-review-herdr-test-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("herdr-review-herdr-test-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
 
         /// Writes an executable stub and returns its path.
         fn stub(&self, name: &str, body: &str) -> PathBuf {
-            let path = self.0.join(name);
+            let path = self.0.path().join(name);
             std::fs::write(&path, body).unwrap();
             #[cfg(unix)]
             {
@@ -369,12 +364,6 @@ mod tests {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
             path
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
@@ -837,7 +826,7 @@ mod tests {
         // line, not by whole content: `HERDR_BIN_PATH` is process-wide, so
         // unrelated close-path calls from parallel tests may share the stub.
         let dir = TempDir::new("config-dir");
-        let log = dir.0.join("calls.log");
+        let log = dir.0.path().join("calls.log");
         let bin = dir.stub(
             "herdr",
             &format!(

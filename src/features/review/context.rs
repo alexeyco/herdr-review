@@ -1,5 +1,6 @@
 //! Parsing the herdr plugin context JSON.
 
+use serde::Deserialize;
 use serde_json::Value;
 
 /// Values read from `HERDR_PLUGIN_CONTEXT_JSON` that the review action needs.
@@ -17,49 +18,53 @@ pub(crate) struct Context {
     pub(crate) tab_id: Option<String>,
 }
 
-/// Parses the plugin context and extracts the fields the review action uses.
-pub(crate) fn parse(json: &str) -> Result<Context, String> {
-    let v: Value =
-        serde_json::from_str(json).map_err(|e| format!("invalid plugin context JSON: {e}"))?;
-    let dir = dir_from_value(&v).ok_or_else(|| {
-        "no directory in plugin context; invoke this action inside a workspace".to_string()
-    })?;
-    Ok(Context {
-        dir,
-        workspace_id: opt_string(&v, "workspace_id"),
-        focused_pane_id: opt_string(&v, "focused_pane_id"),
-        focused_pane_agent: opt_string(&v, "focused_pane_agent"),
-        tab_id: opt_string(&v, "tab_id"),
-    })
+impl Context {
+    /// Parses the plugin context and extracts the fields used by the action.
+    pub(crate) fn parse(json: &str) -> Result<Self, String> {
+        let raw: RawContext =
+            serde_json::from_str(json).map_err(|e| format!("invalid plugin context JSON: {e}"))?;
+        let dir = raw.dir().ok_or_else(|| {
+            "no directory in plugin context; invoke this action inside a workspace".to_string()
+        })?;
+        Ok(Self {
+            dir,
+            workspace_id: raw.workspace_id.as_ref().and_then(value_string),
+            focused_pane_id: raw.focused_pane_id.as_ref().and_then(value_string),
+            focused_pane_agent: raw.focused_pane_agent.as_ref().and_then(value_string),
+            tab_id: raw.tab_id.as_ref().and_then(value_string),
+        })
+    }
 }
 
-/// Picks the first present, non-blank string along the resolution chain:
-/// `worktree.checkout_path` → `workspace_cwd` → `focused_pane_cwd`.
-/// A non-string or whitespace-only value counts as absent.
-fn dir_from_value(v: &Value) -> Option<String> {
-    v.get("worktree")
-        .and_then(|w| w.get("checkout_path"))
-        .and_then(Value::as_str)
-        .and_then(non_blank)
-        .or_else(|| {
-            v.get("workspace_cwd")
-                .and_then(Value::as_str)
-                .and_then(non_blank)
-        })
-        .or_else(|| {
-            v.get("focused_pane_cwd")
-                .and_then(Value::as_str)
-                .and_then(non_blank)
-        })
-        .map(str::to_string)
+#[derive(Deserialize)]
+struct RawContext {
+    worktree: Option<Worktree>,
+    workspace_cwd: Option<Value>,
+    focused_pane_cwd: Option<Value>,
+    workspace_id: Option<Value>,
+    focused_pane_id: Option<Value>,
+    focused_pane_agent: Option<Value>,
+    tab_id: Option<Value>,
 }
 
-/// Top-level field as a non-blank string; non-string or blank counts as absent.
-fn opt_string(v: &Value, key: &str) -> Option<String> {
-    v.get(key)
-        .and_then(Value::as_str)
-        .and_then(non_blank)
-        .map(str::to_string)
+#[derive(Deserialize)]
+struct Worktree {
+    checkout_path: Option<Value>,
+}
+
+impl RawContext {
+    fn dir(&self) -> Option<String> {
+        self.worktree
+            .as_ref()
+            .and_then(|worktree| worktree.checkout_path.as_ref())
+            .and_then(value_string)
+            .or_else(|| self.workspace_cwd.as_ref().and_then(value_string))
+            .or_else(|| self.focused_pane_cwd.as_ref().and_then(value_string))
+    }
+}
+
+fn value_string(value: &Value) -> Option<String> {
+    value.as_str().and_then(non_blank).map(str::to_string)
 }
 
 fn non_blank(s: &str) -> Option<&str> {
@@ -70,6 +75,10 @@ fn non_blank(s: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse(json: &str) -> Result<Context, String> {
+        Context::parse(json)
+    }
 
     const CTX: &str = concat!(
         r#"{"workspace_id":"ws-1","workspace_label":"demo","tab_id":"t1","#,

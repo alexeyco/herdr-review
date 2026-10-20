@@ -1,22 +1,13 @@
 //! Placement and tool settings read from the plugin's `config.toml`.
 //!
-//! The action calls [`load`] exactly once per launch, after the context
-//! parse and before any pane open: the `tool` key decides whether the
-//! review pane opens directly (a configured tool detected on `PATH`) or the
-//! setup dialog shows. The settings layer never fails the launch: every
-//! degradation path (no config directory, missing or unreadable file,
-//! corrupt content, a refused or invalid value) returns documented defaults
-//! with one `herdr-review: warning:` line each. The file follows the
-//! flat-key pattern of the sibling herdr-gitui plugin: top-level
-//! `placement`, `direction`, and `tool` keys, unknown keys ignored. The
-//! `popup` placement is refused for the review pane because the review pane
-//! is a workspace pane and `popup` is not among the placements the herdr
-//! CLI documents for plugin panes.
+//! Invalid or unavailable settings warn and fall back to defaults. The file
+//! has flat `placement`, `direction`, and `tool` keys; unknown keys are ignored.
 
 use std::path::{Path, PathBuf};
 
-use crate::herdr;
-use crate::tool;
+use serde::Deserialize;
+
+use crate::adapters::{herdr, tool};
 
 /// Environment variable carrying the plugin config directory.
 const CONFIG_DIR_ENV: &str = "HERDR_PLUGIN_CONFIG_DIR";
@@ -81,7 +72,7 @@ pub(crate) struct Config {
     pub(crate) direction: Direction,
     /// The `tool` key: a valid catalog id names the review tool the action
     /// checks against `PATH`; unset routes the launch to the setup dialog.
-    pub(crate) tool: Option<&'static tool::Tool>,
+    pub(crate) tool: Option<tool::ReviewTool>,
 }
 
 /// Reads the config once per action launch. Never fails: every degradation
@@ -179,7 +170,7 @@ fn load_from_dir(dir: &Path) -> (Config, Vec<String>) {
 /// value only ever falls back to that key's own default while the other keys
 /// keep their effect. Unknown keys are ignored.
 fn parse_config(content: &str) -> (Config, Vec<String>) {
-    let table: toml::Table = match toml::from_str(content) {
+    let raw: RawConfig = match toml::from_str(content) {
         Ok(table) => table,
         Err(e) => {
             return (
@@ -188,44 +179,48 @@ fn parse_config(content: &str) -> (Config, Vec<String>) {
             );
         }
     };
-    let mut config = Config::default();
     let mut warnings = Vec::new();
-    for (key, value) in &table {
-        match key.as_str() {
-            "placement" => match value.as_str() {
-                Some("tab") => config.placement = Placement::Tab,
-                Some("split") => config.placement = Placement::Split,
-                Some("overlay") => config.placement = Placement::Overlay,
-                Some("zoomed") => config.placement = Placement::Zoomed,
-                Some("popup") => warnings.push(POPUP_REFUSED.to_string()),
-                _ => warnings.push(invalid_placement_warning(value)),
+    let mut config = Config::default();
+    if let Some(value) = raw.placement {
+        match value.as_str() {
+            Some("tab") => config.placement = Placement::Tab,
+            Some("split") => config.placement = Placement::Split,
+            Some("overlay") => config.placement = Placement::Overlay,
+            Some("zoomed") => config.placement = Placement::Zoomed,
+            Some("popup") => warnings.push(POPUP_REFUSED.to_string()),
+            _ => warnings.push(invalid_placement_warning(&value)),
+        }
+    }
+    if let Some(value) = raw.direction {
+        match value.as_str() {
+            Some("right") => config.direction = Direction::Right,
+            Some("down") => config.direction = Direction::Down,
+            Some("auto") => config.direction = Direction::Auto,
+            _ => {
+                config.direction = Direction::Auto;
+                warnings.push(invalid_direction_warning(&value));
+            }
+        }
+    }
+    if let Some(value) = raw.tool {
+        match value.as_str() {
+            Some(id) if id.trim().is_empty() => {}
+            Some(id) => match tool::by_id(id.trim()) {
+                Some(tool) => config.tool = Some(tool),
+                None => warnings.push(invalid_tool_warning(&value)),
             },
-            "direction" => match value.as_str() {
-                Some("right") => config.direction = Direction::Right,
-                Some("down") => config.direction = Direction::Down,
-                Some("auto") => config.direction = Direction::Auto,
-                // An invalid value is treated as `auto` for this launch: no
-                // `--direction` flag is passed.
-                _ => {
-                    config.direction = Direction::Auto;
-                    warnings.push(invalid_direction_warning(value));
-                }
-            },
-            "tool" => match value.as_str() {
-                // An empty or whitespace-only value counts as unset, with no
-                // warning.
-                Some(id) if id.trim().is_empty() => {}
-                Some(id) => match tool::by_id(id.trim()) {
-                    Some(tool) => config.tool = Some(tool),
-                    None => warnings.push(invalid_tool_warning(value)),
-                },
-                None => warnings.push(invalid_tool_warning(value)),
-            },
-            // Unknown keys are ignored: this plugin declares only the three.
-            _ => {}
+            None => warnings.push(invalid_tool_warning(&value)),
         }
     }
     (config, warnings)
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RawConfig {
+    placement: Option<toml::Value>,
+    direction: Option<toml::Value>,
+    tool: Option<toml::Value>,
 }
 
 /// The exact refusal text for `placement = "popup"`: the review pane is a
@@ -276,37 +271,26 @@ fn invalid_tool_warning(value: &toml::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// A scratch directory removed when the test ends.
-    struct TempDir(PathBuf);
+    struct TempDir(tempfile::TempDir);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let dir = std::env::temp_dir().join(format!(
-                "herdr-review-config-test-{tag}-{}-{nanos}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(
+                tempfile::Builder::new()
+                    .prefix(&format!("herdr-review-config-test-{tag}-"))
+                    .tempdir()
+                    .unwrap(),
+            )
         }
 
         fn path(&self) -> &Path {
-            &self.0
+            self.0.path()
         }
 
         fn write_config(&self, content: &str) {
-            std::fs::write(self.0.join("config.toml"), content).unwrap();
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            std::fs::write(self.0.path().join("config.toml"), content).unwrap();
         }
     }
 
@@ -468,13 +452,13 @@ mod tests {
         // selects the tool the action then checks against PATH.
         for id in ["revdiff", "tuicr", "lumen"] {
             let (config, warnings) = parse_config(&format!("tool = \"{id}\""));
-            assert_eq!(config.tool.map(|t| t.id), Some(id), "{id}");
+            assert_eq!(config.tool.map(tool::ReviewTool::id), Some(id), "{id}");
             assert!(warnings.is_empty(), "{id}: {warnings:?}");
         }
         // Whitespace around the id is trimmed like every other env-derived
         // value in the plugin.
         let (config, warnings) = parse_config("tool = \" tuicr \"");
-        assert_eq!(config.tool.map(|t| t.id), Some("tuicr"));
+        assert_eq!(config.tool.map(tool::ReviewTool::id), Some("tuicr"));
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 

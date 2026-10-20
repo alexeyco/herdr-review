@@ -33,8 +33,7 @@ const TERMINAL_THEME_NAME: &str = "terminal";
 /// dialog reads `~/.config/herdr/config.toml`.
 const CONFIG_PATH_ENV: &str = "HERDR_CONFIG_PATH";
 
-/// One color token of a [`Palette`], in the form the renderer needs:
-/// a ready-to-concat SGR escape prefix (possibly empty).
+/// One color token of a [`Palette`], in the form the renderer needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TokenColor {
     /// Truecolor; emits `38;2;r;g;b` / `48;2;r;g;b` sequences.
@@ -44,27 +43,6 @@ pub(crate) enum TokenColor {
     Ansi(u8),
     /// Emit nothing; the terminal's own colors show through.
     Default,
-}
-
-impl TokenColor {
-    /// The foreground SGR escape sequence, empty for [`TokenColor::Default`]
-    /// so the renderer never branches on theme kind.
-    pub(crate) fn fg_sgr(&self) -> String {
-        match self {
-            TokenColor::Rgb(r, g, b) => format!("\x1b[38;2;{r};{g};{b}m"),
-            TokenColor::Ansi(code) => format!("\x1b[{code}m"),
-            TokenColor::Default => String::new(),
-        }
-    }
-
-    /// The background counterpart of [`TokenColor::fg_sgr`].
-    pub(crate) fn bg_sgr(&self) -> String {
-        match self {
-            TokenColor::Rgb(r, g, b) => format!("\x1b[48;2;{r};{g};{b}m"),
-            TokenColor::Ansi(code) => format!("\x1b[{}m", code + 10),
-            TokenColor::Default => String::new(),
-        }
-    }
 }
 
 /// The four tokens the dialog paints, resolved once before the first frame.
@@ -289,7 +267,7 @@ pub(crate) const BUILTIN_PALETTES: &[(&str, Palette); 18] = &[
 
 /// The ANSI-16 palette used for `terminal`, missing/unreadable configs,
 /// invalid TOML, and unknown names: `accent` is ANSI blue, `overlay1` is
-/// ANSI bright black (dark gray), and `text`/`panel_bg` emit no SGR at all.
+/// ANSI bright black (dark gray), and `text`/`panel_bg` use terminal defaults.
 pub(crate) fn fallback_palette() -> Palette {
     Palette {
         accent: TokenColor::Ansi(34),
@@ -396,26 +374,27 @@ mod tests {
     }
 
     /// A temp directory tree that deletes itself recursively.
-    struct TempDir(PathBuf);
+    struct TempDir {
+        path: PathBuf,
+        _temp: tempfile::TempDir,
+    }
 
     impl TempDir {
         /// Creates `<tmp>/herdr-review-theme-test-<pid>-<tag>` containing a
         /// `.config/herdr/config.toml` with `content`.
         fn with_herdr_config(tag: &str, content: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "herdr-review-theme-test-{}-{tag}",
-                std::process::id()
-            ));
+            let temp = tempfile::Builder::new()
+                .prefix(&format!("herdr-review-theme-test-{tag}-"))
+                .tempdir()
+                .unwrap();
+            let dir = temp.path().to_path_buf();
             let config_dir = dir.join(".config/herdr");
             std::fs::create_dir_all(&config_dir).expect("temp home created");
             std::fs::write(config_dir.join("config.toml"), content).expect("temp config written");
-            Self(dir)
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            Self {
+                path: dir,
+                _temp: temp,
+            }
         }
     }
 
@@ -425,21 +404,6 @@ mod tests {
             .find(|(builtin, _)| *builtin == name)
             .unwrap_or_else(|| panic!("{name} is not in the built-in table"))
             .1
-    }
-
-    #[test]
-    fn fg_sgr_and_bg_sgr_emit_the_pinned_sequences() {
-        assert_eq!(
-            TokenColor::Rgb(137, 180, 250).fg_sgr(),
-            "\x1b[38;2;137;180;250m"
-        );
-        assert_eq!(TokenColor::Rgb(24, 24, 37).bg_sgr(), "\x1b[48;2;24;24;37m");
-        assert_eq!(TokenColor::Ansi(34).fg_sgr(), "\x1b[34m");
-        assert_eq!(TokenColor::Ansi(34).bg_sgr(), "\x1b[44m");
-        assert_eq!(TokenColor::Ansi(90).fg_sgr(), "\x1b[90m");
-        assert_eq!(TokenColor::Ansi(90).bg_sgr(), "\x1b[100m");
-        assert_eq!(TokenColor::Default.fg_sgr(), "");
-        assert_eq!(TokenColor::Default.bg_sgr(), "");
     }
 
     #[test]
@@ -499,10 +463,10 @@ mouse = true
         let override_file = TempFile::with_content("override", "[theme]\nname = \"tokyo-night\"\n");
         let home = TempDir::with_herdr_config("other", "[theme]\nname = \"vesper\"\n");
         // The explicit path takes precedence over the home default...
-        let palette = palette_at(Some(&override_file.0), Some(&home.0));
+        let palette = palette_at(Some(&override_file.0), Some(&home.path));
         assert_eq!(palette, palette_of("tokyo-night"));
         // ...while without it the home default is read.
-        let palette = palette_at(None, Some(&home.0));
+        let palette = palette_at(None, Some(&home.path));
         assert_eq!(palette, palette_of("vesper"));
     }
 
@@ -573,9 +537,9 @@ mouse = true
         assert_eq!(palette.overlay1, TokenColor::Ansi(90));
         assert_eq!(palette.text, TokenColor::Default);
         assert_eq!(palette.panel_bg, TokenColor::Default);
-        assert_eq!(palette.accent.bg_sgr(), "\x1b[44m");
-        assert_eq!(palette.overlay1.fg_sgr(), "\x1b[90m");
-        assert_eq!(palette.text.fg_sgr(), "");
-        assert_eq!(palette.panel_bg.bg_sgr(), "");
+        assert_eq!(palette.accent, TokenColor::Ansi(34));
+        assert_eq!(palette.overlay1, TokenColor::Ansi(90));
+        assert_eq!(palette.text, TokenColor::Default);
+        assert_eq!(palette.panel_bg, TokenColor::Default);
     }
 }
