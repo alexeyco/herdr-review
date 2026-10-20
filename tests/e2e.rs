@@ -15,10 +15,9 @@
 //! contract: any `--workspace` on an `overlay`/`popup` open, or a
 //! `split`/`zoomed` open without `--target-pane`, exits 1 with the daemon's
 //! `invalid_params` body. Action runs write a real `config.toml` under
-//! `HERDR_PLUGIN_CONFIG_DIR` to drive both branches — the direct
-//! review-pane open and the setup popup. Setup-dialog runs pipe a scripted
-//! keypress into stdin and resolve a stub `stty` from `PATH`, so the
-//! raw-mode TUI runs without touching a real terminal. Probe-failure tests
+//! `HERDR_PLUGIN_CONFIG_DIR` to exercise placement, direction, and ignored
+//! obsolete tool settings. Setup-dialog runs use piped input and the
+//! non-interactive text fallback. Probe-failure tests
 //! run with a `git`-less `PATH` or a stub `git` that fails one probe
 //! command. Everything runs in a unique temp directory and needs no network
 //! or global git config.
@@ -77,10 +76,16 @@ if [ "$1" = "plugin" ] && [ "$2" = "pane" ] && [ "$3" = "open" ]; then
   # alexeyco.review --entrypoint <ep> --placement <p> ...
   if [ "$7" = "setup" ]; then
     printf '%s\n' '{"id":"cli:plugin","result":{"type":"ok"}}'
+  elif [ "$7" = "picker" ]; then
+    printf '%s\n' '{"id":"cli:plugin","result":{"type":"ok"}}'
   else
     printf '%s\n' '{"result":{"plugin_pane":{"pane":{"pane_id":"pane-stub","tab_id":"tab-stub"}}}}'
   fi
 elif [ "$1" = "plugin" ] && [ "$2" = "config-dir" ] && [ "$3" = "alexeyco.review" ]; then
+  if [ "${HERDR_STUB_FAIL_CONFIG_DIR:-0}" = "1" ]; then
+    echo 'stub config-dir failure' >&2
+    exit 1
+  fi
   printf '%s\n' "${STUB_CONFIG_DIR:-/nonexistent-stub-config}"
 fi
 exit 0
@@ -188,18 +193,6 @@ esac
 exit "${LUMEN_RC:-0}"
 "#;
 
-/// Stub `stty` for the setup-dialog runs: `stty -g` answers a saved-settings
-/// line (non-empty, so `RawMode::enter` accepts it) and every other call
-/// succeeds silently. Only the setup dialog spawns `stty`; with it on `PATH`
-/// the dialog TUI runs hermetically — the key loop reads the piped stdin,
-/// not a terminal.
-const STTY_STUB: &str = r#"#!/bin/sh
-if [ "$1" = "-g" ]; then
-  printf 'stub-stty-settings\n'
-fi
-exit 0
-"#;
-
 /// Stub `git` for the unexpected-exit-code probe test: `diff --quiet` exits 2
 /// (an undocumented quiet-diff code); everything else delegates to the real
 /// git resolved once at test start and baked in via `$REAL_GIT`.
@@ -237,18 +230,16 @@ impl Fixture {
         Self { dir }
     }
 
-    /// Writes the `herdr`, `stty`, and review-tool stubs (`revdiff`, `tuicr`,
-    /// `lumen`) into a stub bin directory and returns `(herdr, log)`. The
-    /// directory goes on `PATH` (see [`Fixture::path_with_stubs`]) so the
-    /// review pane resolves the stub tools PATH-only and setup-dialog runs
-    /// resolve the stub `stty` instead of touching a real terminal.
+    /// Writes the `herdr` and review-tool stubs (`revdiff`, `tuicr`, `lumen`)
+    /// into a stub bin directory and returns `(herdr, log)`. The directory
+    /// goes on `PATH` (see [`Fixture::path_with_stubs`]) so the review pane
+    /// resolves the stub tools PATH-only.
     fn stubs(&self) -> (PathBuf, PathBuf) {
         let bin = self.subdir("bin");
         write_executable(&bin.join("herdr"), HERDR_STUB);
         write_executable(&bin.join("revdiff"), REVDIFF_STUB);
         write_executable(&bin.join("tuicr"), TUICR_STUB);
         write_executable(&bin.join("lumen"), LUMEN_STUB);
-        write_executable(&bin.join("stty"), STTY_STUB);
         (bin.join("herdr"), self.dir.join("stub.log"))
     }
 
@@ -260,6 +251,24 @@ impl Fixture {
             self.dir.join("bin").display(),
             std::env::var("PATH").unwrap_or_default()
         )
+    }
+
+    fn path_with_only_tool(&self, tool: &str) -> String {
+        let bin = self.dir.join("bin");
+        for candidate in ["revdiff", "tuicr", "lumen"] {
+            if candidate != tool {
+                let _ = fs::remove_file(bin.join(candidate));
+            }
+        }
+        bin.to_string_lossy().into_owned()
+    }
+
+    fn path_without_tools(&self) -> String {
+        let bin = self.dir.join("bin");
+        for candidate in ["revdiff", "tuicr", "lumen"] {
+            let _ = fs::remove_file(bin.join(candidate));
+        }
+        bin.to_string_lossy().into_owned()
     }
 
     /// Creates a subdirectory and returns its path.
@@ -328,6 +337,51 @@ fn run_plugin_with_stdin(envs: &[(&str, &str)], keys: &[u8]) -> Output {
         stdin.write_all(keys).unwrap();
     }
     child.wait_with_output().unwrap()
+}
+
+/// Runs action mode with one hermetically installed review tool and the given
+/// config source. `via_env` selects `HERDR_PLUGIN_CONFIG_DIR`; otherwise the
+/// stub CLI resolves `config_dir` or fails when `fail_config_dir` is true.
+fn run_action_config_case(
+    fx: &Fixture,
+    content: Option<&str>,
+    via_env: bool,
+    fail_config_dir: bool,
+) -> (Output, String, PathBuf) {
+    let repo = fx.subdir("repo");
+    let config_dir = fx.subdir("config");
+    if let Some(content) = content {
+        fs::write(config_dir.join("config.toml"), content).unwrap();
+    }
+    let (herdr, log) = fx.stubs();
+    let path = fx.path_with_only_tool("revdiff");
+    let ctx = format!(
+        r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","worktree":{{"checkout_path":"{}"}}}}"#,
+        repo.display()
+    );
+    let mut env = vec![
+        ("HERDR_PLUGIN_ACTION_ID", "review"),
+        ("HERDR_PLUGIN_CONTEXT_JSON", ctx.as_str()),
+        ("HERDR_BIN_PATH", herdr.to_str().unwrap()),
+        ("PATH", path.as_str()),
+        ("STUB_LOG", log.to_str().unwrap()),
+        ("STUB_CONFIG_DIR", config_dir.to_str().unwrap()),
+        (
+            "HERDR_STUB_FAIL_CONFIG_DIR",
+            if fail_config_dir { "1" } else { "0" },
+        ),
+    ];
+    if via_env {
+        env.push(("HERDR_PLUGIN_CONFIG_DIR", config_dir.to_str().unwrap()));
+    }
+    let out = run_plugin(&env);
+    (out, read_log(&log), repo)
+}
+
+fn action_review_open(log: &str) -> &str {
+    log.lines()
+        .find(|line| line.starts_with("plugin pane open") && line.contains("--entrypoint review"))
+        .unwrap_or("")
 }
 
 /// Runs git in `dir` with global config disabled and an inline identity where
@@ -1573,8 +1627,8 @@ fn pane_lumen_dirty_repo_passes_diff() {
 // --- action runs ----------------------------------------------------------
 
 #[test]
-fn action_opens_the_review_pane_directly_for_a_configured_tool() {
-    // Scenarios "Configured installed tool opens the review pane directly"
+fn action_opens_the_review_pane_directly_for_the_sole_installed_tool() {
+    // Scenarios "One catalog tool is installed"
     // and "The tool env pair is always present" (e2e side): the review-pane
     // open argv pins the tab shape, the success log names the pane and tab,
     // a best-effort focus runs, and no setup popup is opened. "Caller tab
@@ -1583,9 +1637,9 @@ fn action_opens_the_review_pane_directly_for_a_configured_tool() {
     let fx = Fixture::new("action-direct");
     let repo = fx.subdir("repo");
     let config_dir = fx.subdir("config");
-    fs::write(config_dir.join("config.toml"), "tool = \"revdiff\"\n").unwrap();
+    fs::write(config_dir.join("config.toml"), "tool = \"lumen\"\n").unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_with_only_tool("revdiff");
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","focused_pane_agent":"claude","tab_id":"w3X:t9","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -1607,6 +1661,7 @@ fn action_opens_the_review_pane_directly_for_a_configured_tool() {
         stderr(&out)
     );
     let logged = read_log(&log);
+    assert!(!logged.contains("--entrypoint picker"), "{logged}");
     let open = logged
         .lines()
         .find(|l| l.starts_with("plugin pane open"))
@@ -1653,6 +1708,79 @@ fn action_opens_the_review_pane_directly_for_a_configured_tool() {
 }
 
 #[test]
+fn action_opens_picker_for_multiple_installed_tools_without_opening_review() {
+    let fx = Fixture::new("action-picker");
+    let repo = fx.subdir("repo");
+    let config_dir = fx.subdir("config");
+    fs::write(
+        config_dir.join("config.toml"),
+        "tool = \"lumen\"\nplacement = \"split\"\ndirection = \"down\"\n",
+    )
+    .unwrap();
+    let (herdr, log) = fx.stubs();
+    let path = fx.path_with_stubs();
+    let ctx = format!(
+        r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","worktree":{{"checkout_path":"{}"}}}}"#,
+        repo.display()
+    );
+
+    let out = run_plugin(&[
+        ("HERDR_PLUGIN_ACTION_ID", "review"),
+        ("HERDR_PLUGIN_CONTEXT_JSON", &ctx),
+        ("HERDR_PLUGIN_CONFIG_DIR", config_dir.to_str().unwrap()),
+        ("HERDR_BIN_PATH", herdr.to_str().unwrap()),
+        ("PATH", &path),
+        ("STUB_LOG", log.to_str().unwrap()),
+    ]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let logged = read_log(&log);
+    let open = logged
+        .lines()
+        .find(|line| line.starts_with("plugin pane open"))
+        .unwrap_or("");
+    assert!(
+        open.contains("--entrypoint picker --placement popup"),
+        "{open}"
+    );
+    assert!(
+        open.contains("HERDR_REVIEWS_PICKER_TOOL_IDS=lumen,revdiff,tuicr"),
+        "{open}"
+    );
+    assert!(open.contains("HERDR_REVIEWS_PLACEMENT=split"), "{open}");
+    assert!(open.contains("HERDR_REVIEWS_DIRECTION=down"), "{open}");
+    assert!(!logged.contains("--entrypoint review"), "{logged}");
+}
+
+#[test]
+fn picker_without_interactive_input_exits_without_launching_a_tool() {
+    let fx = Fixture::new("picker-noninteractive");
+    let (herdr, log) = fx.stubs();
+    let state = fx.subdir("state");
+    let repo = fx.subdir("repo");
+    let path = fx.path_with_stubs();
+    let out = run_plugin(&[
+        ("HERDR_PLUGIN_ENTRYPOINT_ID", "picker"),
+        ("HERDR_REVIEWS_PICKER_TOOL_IDS", "lumen,revdiff"),
+        ("HERDR_REVIEWS_DIR", repo.to_str().unwrap()),
+        ("HERDR_REVIEWS_PLACEMENT", "split"),
+        ("HERDR_REVIEWS_DIRECTION", "down"),
+        ("HERDR_PLUGIN_STATE_DIR", state.to_str().unwrap()),
+        ("HERDR_BIN_PATH", herdr.to_str().unwrap()),
+        ("PATH", &path),
+        ("STUB_LOG", log.to_str().unwrap()),
+    ]);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tool selection unavailable without an interactive terminal"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(read_log(&log).is_empty(), "{}", read_log(&log));
+}
+
+#[test]
 fn action_opens_the_split_review_pane_on_the_caller() {
     // Scenarios "Split and zoomed pass the caller pane as target" and
     // "Direction is passed only for split placement", e2e side: the caller
@@ -1668,7 +1796,7 @@ fn action_opens_the_split_review_pane_on_the_caller() {
     )
     .unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_with_only_tool("revdiff");
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","focused_pane_agent":"claude","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -1738,7 +1866,7 @@ fn action_split_without_a_caller_falls_back_to_tab() {
     )
     .unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_with_only_tool("revdiff");
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -1778,8 +1906,8 @@ fn action_split_without_a_caller_falls_back_to_tab() {
 }
 
 #[test]
-fn action_unconfigured_tool_opens_the_setup_dialog() {
-    // Scenarios "Unset tool opens the setup dialog" and "Action success
+fn action_with_zero_installed_tools_opens_the_setup_dialog() {
+    // Scenarios "No catalog tools are installed" and "Action success
     // opens the popup and exits": the exact setup argv is logged, no review
     // pane opens, and no focus call or hold follows the open. "Setup popup
     // never carries the caller tab": the context carries a `tab_id`, yet the
@@ -1789,7 +1917,7 @@ fn action_unconfigured_tool_opens_the_setup_dialog() {
     let config_dir = fx.subdir("config");
     fs::write(config_dir.join("config.toml"), "placement = \"tab\"\n").unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_without_tools();
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","focused_pane_agent":"claude","tab_id":"w3X:t9","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -1830,15 +1958,14 @@ fn action_unconfigured_tool_opens_the_setup_dialog() {
 }
 
 #[test]
-fn action_missing_configured_tool_opens_the_setup_dialog() {
-    // Scenario "Configured missing tool opens the setup dialog": `tool =
-    // "lumen"` with no executable lumen on the action's PATH, so the setup
-    // popup opens and no review pane does.
+fn action_with_zero_tools_ignores_obsolete_tool_config_and_opens_setup() {
+    // Scenario "No catalog tools are installed": even an obsolete configured
+    // tool id cannot bypass PATH detection, so setup opens without a review pane.
     let fx = Fixture::new("action-missing");
     let repo = fx.subdir("repo");
     let config_dir = fx.subdir("config");
     fs::write(config_dir.join("config.toml"), "tool = \"lumen\"\n").unwrap();
-    // A PATH carrying only the herdr stub: no catalog tool is executable.
+    // A hermetic PATH carrying only the herdr stub: no catalog tool is executable.
     let bin = fx.subdir("herdr-only");
     write_executable(&bin.join("herdr"), HERDR_STUB);
     let herdr = bin.join("herdr");
@@ -1877,16 +2004,14 @@ fn action_missing_configured_tool_opens_the_setup_dialog() {
 }
 
 #[test]
-fn action_invalid_tool_value_warns_and_opens_the_setup_dialog() {
-    // Scenario "Invalid tool value opens the setup dialog after a warning":
-    // the config layer warns naming `diffy`, the key counts as unset, and
-    // the action opens the setup popup.
+fn action_ignores_obsolete_tool_config_and_uses_installed_tool() {
+    // The obsolete `tool` key is ignored; the sole installed tool wins.
     let fx = Fixture::new("action-invalid");
     let repo = fx.subdir("repo");
     let config_dir = fx.subdir("config");
     fs::write(config_dir.join("config.toml"), "tool = \"diffy\"\n").unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_with_only_tool("revdiff");
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","focused_pane_agent":"claude","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -1902,31 +2027,150 @@ fn action_invalid_tool_value_warns_and_opens_the_setup_dialog() {
     ]);
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
-    assert!(
-        stderr(&out).contains("herdr-review: warning: invalid tool in config.toml: \"diffy\""),
-        "stderr: {}",
-        stderr(&out)
-    );
-    assert!(
-        stderr(&out).contains("treating it as unset"),
-        "stderr: {}",
-        stderr(&out)
-    );
+
     let logged = read_log(&log);
     let open = logged
         .lines()
         .find(|l| l.starts_with("plugin pane open"))
         .unwrap_or("");
-    assert_eq!(
-        open,
-        "plugin pane open --plugin alexeyco.review --entrypoint setup --placement popup --focus"
-    );
-    assert!(!logged.contains("--entrypoint review"), "{logged}");
+    assert!(open.contains("--entrypoint review"), "{open}");
+    assert!(open.contains("--env HERDR_REVIEW_TOOL=revdiff"), "{open}");
     assert!(
-        !stderr(&out).contains("press Enter to close"),
+        !stderr(&out).contains("invalid tool"),
         "stderr: {}",
         stderr(&out)
     );
+}
+
+#[test]
+fn action_config_directory_failure_uses_defaults_and_selects_installed_tool() {
+    let fx = Fixture::new("action-config-dir-failure");
+    let (out, logged, _) = run_action_config_case(&fx, None, false, true);
+    let open = action_review_open(&logged);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("config directory unavailable:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(open.contains("--placement tab"), "{open}");
+    assert!(!open.contains("--direction"), "{open}");
+    assert!(open.contains("--env HERDR_REVIEW_TOOL=revdiff"), "{open}");
+}
+
+#[test]
+fn action_missing_config_file_uses_defaults_and_selects_installed_tool() {
+    let fx = Fixture::new("action-missing-config-file");
+    let (out, logged, _) = run_action_config_case(&fx, None, false, false);
+    let open = action_review_open(&logged);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no config.toml at "),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(open.contains("--placement tab"), "{open}");
+    assert!(!open.contains("--direction"), "{open}");
+    assert!(open.contains("--env HERDR_REVIEW_TOOL=revdiff"), "{open}");
+}
+
+#[test]
+fn action_corrupt_config_uses_defaults_and_selects_installed_tool() {
+    let fx = Fixture::new("action-corrupt-config");
+    let (out, logged, _) = run_action_config_case(&fx, Some("placement = [\n"), true, false);
+    let open = action_review_open(&logged);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(
+        stderr(&out).contains("invalid config.toml:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(open.contains("--placement tab"), "{open}");
+    assert!(!open.contains("--direction"), "{open}");
+    assert!(open.contains("--env HERDR_REVIEW_TOOL=revdiff"), "{open}");
+}
+
+#[test]
+fn action_maps_overlay_placement_to_review_open() {
+    let fx = Fixture::new("action-overlay");
+    let (out, logged, _) =
+        run_action_config_case(&fx, Some("placement = \"overlay\"\n"), true, false);
+    let open = action_review_open(&logged);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    assert!(open.contains("--placement overlay"), "{open}");
+    assert!(!open.contains("--workspace"), "{open}");
+    assert!(
+        !stderr(&out).contains("herdr-review: warning:"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn action_refuses_popup_and_unknown_placement_with_tab_fallback() {
+    for (tag, placement, warning) in [
+        (
+            "popup",
+            "popup",
+            r#"placement "popup" is not supported for the review pane; using "tab""#,
+        ),
+        (
+            "floating",
+            "floating",
+            r#"invalid placement in config.toml: "floating""#,
+        ),
+    ] {
+        let fx = Fixture::new(&format!("action-placement-{tag}"));
+        let config = format!("placement = \"{placement}\"\n");
+        let (out, logged, _) = run_action_config_case(&fx, Some(&config), true, false);
+        let open = action_review_open(&logged);
+
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+        assert!(stderr(&out).contains(warning), "stderr: {}", stderr(&out));
+        assert!(open.contains("--placement tab"), "{open}");
+    }
+}
+
+#[test]
+fn action_applies_direction_only_to_valid_split_directions() {
+    for (tag, config, expected_placement, warning) in [
+        (
+            "auto",
+            "placement = \"split\"\ndirection = \"auto\"\n",
+            "split",
+            None,
+        ),
+        (
+            "tab-down",
+            "placement = \"tab\"\ndirection = \"down\"\n",
+            "tab",
+            None,
+        ),
+        (
+            "left",
+            "placement = \"split\"\ndirection = \"left\"\n",
+            "split",
+            Some(r#"invalid direction in config.toml: "left""#),
+        ),
+    ] {
+        let fx = Fixture::new(&format!("action-direction-{tag}"));
+        let (out, logged, _) = run_action_config_case(&fx, Some(config), true, false);
+        let open = action_review_open(&logged);
+
+        assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+        if let Some(warning) = warning {
+            assert!(stderr(&out).contains(warning), "stderr: {}", stderr(&out));
+        }
+        assert!(
+            open.contains(&format!("--placement {expected_placement}")),
+            "{open}"
+        );
+        assert!(!open.contains("--direction"), "{open}");
+    }
 }
 
 #[test]
@@ -1938,7 +2182,7 @@ fn action_takes_pane_id_from_the_environment() {
     let config_dir = fx.subdir("config");
     fs::write(config_dir.join("config.toml"), "tool = \"revdiff\"\n").unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_with_only_tool("revdiff");
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -1976,7 +2220,7 @@ fn action_without_context_agent_omits_the_env_pair() {
     let config_dir = fx.subdir("config");
     fs::write(config_dir.join("config.toml"), "tool = \"revdiff\"\n").unwrap();
     let (herdr, log) = fx.stubs();
-    let path = fx.path_with_stubs();
+    let path = fx.path_with_only_tool("revdiff");
     let ctx = format!(
         r#"{{"workspace_id":"ws-1","focused_pane_id":"p1","worktree":{{"checkout_path":"{}"}}}}"#,
         repo.display()
@@ -2034,20 +2278,19 @@ fn setup_dialog_closes_on_a_key_without_any_call() {
     // directory for its path line, draws the one universal layout, and
     // closes on the scripted key — exit 0, no pane open, no hold. Scenarios
     // "Cancel exits cleanly" and "Every entry case renders the same dialog"
-    // (the dialog ignores the config content and PATH: a configured
-    // missing tool and a tool-less PATH render the same static rows) over
+    // (the dialog ignores config content and PATH and always renders the
+    // same static rows) over
     // the real binary, plus the brew install-command strings and the repo
     // URL of "Tool rows are alphabetical with dim inline install commands"
     // and "Repo URL line closes the content".
     let fx = Fixture::new("setup-close");
     let config_dir = fx.subdir("config");
     fs::write(config_dir.join("config.toml"), "tool = \"lumen\"\n").unwrap();
-    // A PATH with the herdr and stty stubs only: no catalog tool is
-    // executable. The dialog performs no PATH detection, so this renders
-    // identically to any other entry case.
+    // A PATH with the herdr stub only: no catalog tool is executable. The
+    // dialog performs no PATH detection, so this renders identically to any
+    // other entry case.
     let bin = fx.subdir("herdr-only");
     write_executable(&bin.join("herdr"), HERDR_STUB);
-    write_executable(&bin.join("stty"), STTY_STUB);
     let herdr = bin.join("herdr");
     let log = fx.dir.join("stub.log");
     let path = bin.to_str().unwrap().to_string();
@@ -2096,6 +2339,10 @@ fn setup_dialog_closes_on_a_key_without_any_call() {
     );
     let logged = read_log(&log);
     assert!(!logged.contains("plugin pane open"), "{logged}");
+    assert!(
+        logged.is_empty(),
+        "dialog unexpectedly queried herdr configuration: {logged}"
+    );
     assert!(
         !stderr(&out).contains("press Enter to close"),
         "stderr: {}",

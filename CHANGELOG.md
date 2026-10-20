@@ -4,6 +4,21 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.3.0
+
+### Added
+
+- Open a compact picker when multiple supported review tools are installed; open the only installed tool directly or show setup guidance when none are installed.
+
+### Changed
+
+- Choose tools from installed executables on `PATH` instead of the `tool` config key; retain `placement` and `direction` settings.
+- Use terminal-default colors in the setup dialog.
+
+### Fixed
+
+- Retry launching a freshly written tool binary when the operating system reports `ETXTBSY`.
+
 ## 0.2.0
 
 ### Added

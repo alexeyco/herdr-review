@@ -1,13 +1,13 @@
-//! Placement and tool settings read from the plugin's `config.toml`.
+//! Placement settings read from the plugin's `config.toml`.
 //!
 //! Invalid or unavailable settings warn and fall back to defaults. The file
-//! has flat `placement`, `direction`, and `tool` keys; unknown keys are ignored.
+//! has flat `placement` and `direction` keys; unknown keys are ignored.
 
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::adapters::{herdr, tool};
+use crate::adapters::herdr;
 
 /// Environment variable carrying the plugin config directory.
 const CONFIG_DIR_ENV: &str = "HERDR_PLUGIN_CONFIG_DIR";
@@ -62,17 +62,14 @@ impl Direction {
     }
 }
 
-/// The flat-key settings. Defaults: `placement = "tab"`,
-/// `direction = "right"`, `tool` unset.
+/// The flat-key settings. Defaults: `placement = "tab"` and
+/// `direction = "right"`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Config {
     /// The `placement` key.
     pub(crate) placement: Placement,
     /// The `direction` key; only applied when placement is `split`.
     pub(crate) direction: Direction,
-    /// The `tool` key: a valid catalog id names the review tool the action
-    /// checks against `PATH`; unset routes the launch to the setup dialog.
-    pub(crate) tool: Option<tool::ReviewTool>,
 }
 
 /// Reads the config once per action launch. Never fails: every degradation
@@ -202,16 +199,6 @@ fn parse_config(content: &str) -> (Config, Vec<String>) {
             }
         }
     }
-    if let Some(value) = raw.tool {
-        match value.as_str() {
-            Some(id) if id.trim().is_empty() => {}
-            Some(id) => match tool::by_id(id.trim()) {
-                Some(tool) => config.tool = Some(tool),
-                None => warnings.push(invalid_tool_warning(&value)),
-            },
-            None => warnings.push(invalid_tool_warning(&value)),
-        }
-    }
     (config, warnings)
 }
 
@@ -220,7 +207,6 @@ fn parse_config(content: &str) -> (Config, Vec<String>) {
 struct RawConfig {
     placement: Option<toml::Value>,
     direction: Option<toml::Value>,
-    tool: Option<toml::Value>,
 }
 
 /// The exact refusal text for `placement = "popup"`: the review pane is a
@@ -252,19 +238,6 @@ fn invalid_direction_warning(value: &toml::Value) -> String {
     format!(
         "invalid direction in config.toml: {shown}; \
          expected one of right|down|auto, treating it as auto"
-    )
-}
-
-/// Warning for an invalid or non-string `tool` value: the key counts as unset
-/// for that launch, routing it to the setup dialog.
-fn invalid_tool_warning(value: &toml::Value) -> String {
-    let shown = match value.as_str() {
-        Some(s) => format!("\"{s}\""),
-        None => "non-string value".to_string(),
-    };
-    format!(
-        "invalid tool in config.toml: {shown}; \
-         expected one of revdiff, tuicr, lumen; treating it as unset"
     )
 }
 
@@ -333,7 +306,6 @@ mod tests {
         // the tool is unset, so the launch continues to the setup dialog.
         let (config, warnings) = load_with(Err("herdr did not provide HERDR_BIN_PATH".to_string()));
         assert_eq!(config, Config::default());
-        assert_eq!(config.tool, None);
         assert_eq!(warnings.len(), 1, "{:?}", warnings);
         assert!(
             warnings[0].contains("config directory unavailable: herdr did not provide"),
@@ -350,11 +322,10 @@ mod tests {
     #[test]
     fn missing_file_uses_defaults_with_one_warning() {
         // Scenario "Missing file uses defaults": tab placement, right
-        // direction, tool unset, and exactly one warning line.
+        // direction defaults, and exactly one warning line.
         let dir = TempDir::new("missing-file");
         let (config, warnings) = load_from_dir(dir.path());
         assert_eq!(config, Config::default());
-        assert_eq!(config.tool, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("no config.toml"), "{warnings:?}");
     }
@@ -368,13 +339,11 @@ mod tests {
         dir.write_config("placement = ");
         let (config, warnings) = load_from_dir(dir.path());
         assert_eq!(config, Config::default());
-        assert_eq!(config.tool, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("invalid config.toml"), "{warnings:?}");
         // A non-directory directory path also degrades without failing.
         let (config, warnings) = load_from_dir(&dir.path().join("gone"));
         assert_eq!(config, Config::default());
-        assert_eq!(config.tool, None);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
@@ -447,49 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn valid_tool_id_is_taken_as_configured() {
-        // Scenario "Valid tool id is taken as configured": a catalog id
-        // selects the tool the action then checks against PATH.
-        for id in ["revdiff", "tuicr", "lumen"] {
-            let (config, warnings) = parse_config(&format!("tool = \"{id}\""));
-            assert_eq!(config.tool.map(tool::ReviewTool::id), Some(id), "{id}");
-            assert!(warnings.is_empty(), "{id}: {warnings:?}");
-        }
-        // Whitespace around the id is trimmed like every other env-derived
-        // value in the plugin.
-        let (config, warnings) = parse_config("tool = \" tuicr \"");
-        assert_eq!(config.tool.map(tool::ReviewTool::id), Some("tuicr"));
-        assert!(warnings.is_empty(), "{warnings:?}");
-    }
-
-    #[test]
-    fn invalid_tool_value_warns_and_counts_as_unset() {
-        // Scenario "Invalid tool value warns and counts as unset": one
-        // warning naming the value; the tool counts as unset, routing the
-        // launch to the setup dialog.
-        let (config, warnings) = parse_config("tool = \"diffy\"");
-        assert_eq!(config.tool, None);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("\"diffy\""), "{warnings:?}");
-        assert!(warnings[0].contains("treating it as unset"), "{warnings:?}");
-        // A non-string value degrades the same way.
-        let (config, warnings) = parse_config("tool = 42");
-        assert_eq!(config.tool, None);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].contains("non-string value"), "{warnings:?}");
-    }
-
-    #[test]
-    fn blank_tool_value_counts_as_unset() {
-        // Scenario "Blank tool value counts as unset": silently, no warning.
-        for content in ["tool = \"\"", "tool = \"   \"", "tool = \"\\t\""] {
-            let (config, warnings) = parse_config(content);
-            assert_eq!(config.tool, None, "{content}");
-            assert!(warnings.is_empty(), "{content}: {warnings:?}");
-        }
-    }
-
-    #[test]
     fn split_with_direction() {
         // Scenario "Split with direction".
         let (config, warnings) = parse_config("placement = \"split\"\ndirection = \"down\"\n");
@@ -534,7 +460,8 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_ignored_without_warning() {
-        let (config, warnings) = parse_config("answer = 42\nplacement = \"zoomed\"\n");
+        let (config, warnings) =
+            parse_config("answer = 42\ntool = \"nonsense\"\nplacement = \"zoomed\"\n");
         assert_eq!(config.placement, Placement::Zoomed);
         assert!(warnings.is_empty(), "{warnings:?}");
     }
@@ -547,13 +474,12 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_tab_right_and_no_tool() {
+    fn defaults_are_tab_and_right() {
         assert_eq!(
             Config::default(),
             Config {
                 placement: Placement::Tab,
                 direction: Direction::Right,
-                tool: None,
             }
         );
     }

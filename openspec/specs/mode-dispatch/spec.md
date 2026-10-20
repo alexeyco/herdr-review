@@ -1,4 +1,4 @@
-# mode-dispatch
+# Mode Dispatch
 
 ## Purpose
 

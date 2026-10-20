@@ -1,4 +1,4 @@
-# review-scope-selection
+# Review Scope Selection
 
 ## Purpose
 

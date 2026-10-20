@@ -4,11 +4,11 @@
 
 herdr plugin that reviews diffs with the human review TUI of your choice and delivers your annotations to the agent in the focused pane.
 
-[herdr](https://herdr.dev) is a terminal workspace manager and agent multiplexer. The catalog holds three tools — [revdiff](https://github.com/umputun/revdiff), [tuicr](https://github.com/agavra/tuicr), and [lumen](https://github.com/jnsahaj/lumen). All three are human diff-review TUIs: you scroll the diff and author the annotations yourself. No LLM keys, accounts, or provider configuration are involved in this flow (lumen ships optional AI helpers; this plugin never calls them). The tool that runs is fixed by hand in the plugin's `config.toml` (`tool` key); one keypress opens it in a pane rooted at the repository, and when you finish the review the plugin collects the tool's annotation export and sends it to the focused agent as one prompt. It targets the herdr plugin API v1 and runs on Linux and macOS (Windows untested).
+[herdr](https://herdr.dev) is a terminal workspace manager and agent multiplexer. The catalog holds three tools — [revdiff](https://github.com/umputun/revdiff), [tuicr](https://github.com/agavra/tuicr), and [lumen](https://github.com/jnsahaj/lumen). All three are human diff-review TUIs: you scroll the diff and author the annotations yourself. No LLM keys, accounts, or provider configuration are involved in this flow (lumen ships optional AI helpers; this plugin never calls them). One keypress opens the sole installed tool directly or shows a compact picker when multiple tools are installed; the last choice is remembered. When you finish the review, the plugin collects the tool's annotation export and sends it to the focused agent as one prompt. It targets the herdr plugin API v1 and runs on Linux and macOS (Windows untested).
 
 ## Demo
 
-One keypress opens the configured review tool directly; the annotations you author arrive in the focused agent as a single prompt. When no usable tool is configured, the same keypress opens a read-only setup dialog instead.
+One keypress opens the installed review tool directly when there is one, or shows a picker when there are several; the annotations you author arrive in the focused agent as a single prompt. When no supported tool is installed, the same keypress opens a read-only setup dialog.
 
 <!-- TODO: record a short demo GIF or asciinema cast (keypress → review tool TUI → annotations delivered, plus the setup dialog) and embed here; keep it under ~15s -->
 
@@ -105,12 +105,12 @@ All cells checked 2026-10-18 against the linked public sources.
 
 </details>
 
-Among the tools compared above, this plugin is the only one that combines annotation delivery into the agent pane on review close — no extra keypress — with a user-selectable underlying review tool. The five competitors each deliver annotations through a key or an action, and each ships a single built-in viewer.
+Among the tools compared above, this plugin is the only one that combines annotation delivery into the agent pane on review close — no extra keypress — with a choice among multiple installed review tools. The five competitors each deliver annotations through a key or an action, and each ships a single built-in viewer.
 
 ## The flow
 
-1. The **action** (`alexeyco.review.open`) resolves the repository and the caller identity from the plugin context, reads `config.toml` once, and checks the configured `tool` against the daemon's `PATH`. A valid id with an executable binary opens the **review pane** directly — the main path, no dialog. Otherwise (unset, blank, invalid, or valid but missing from `PATH`) it opens the read-only **setup dialog** instead and no review pane opens: the dialog shows one universal layout — the config file path, the three catalog rows with their dim inline install commands, and the repository URL — and `Enter`, `q`, and `Esc` each close it.
-2. The **review pane** opens with the placement from your `config.toml`, announces the scope (`herdr-review: reviewing uncommitted changes` or `herdr-review: reviewing vs <base>`), and runs the configured tool as a direct child — argv-exec, no shell layer, no echoed command, straight into the TUI.
+1. The **action** (`alexeyco.review.open`) resolves the repository and caller identity, reads placement/direction from `config.toml`, and checks the daemon's `PATH` for installed catalog tools. No installed tools opens the read-only **setup dialog**; one installed tool opens the **review pane** directly; multiple tools open a compact picker. The setup dialog shows the config path, install commands, and repository URL, then closes on any key.
+2. In the **picker**, Up/Down moves the highlight, Enter opens the selected tool, and Esc closes without launching. The last selected tool is highlighted the next time it remains installed. The review pane opens with configured placement and announces the scope (`herdr-review: reviewing uncommitted changes` or `herdr-review: reviewing vs <base>`), then runs the selected tool as a direct child — argv-exec, no shell layer, no echoed command, straight into the TUI.
 3. When you finish, the plugin collects the annotations — revdiff's output file, tuicr's saved review session, or lumen's stdout export — converts them to a common block format, and delivers them to the agent in the focused pane as one prompt: `Review annotations from <tool>:` followed by `## <path>:<line> (+|-)` annotation blocks. After a clean ending — the prompt delivered or no annotations found — focus returns to the tab you launched the review from and the pane closes (best-effort; hold and error paths leave focus alone). With no agent to receive them, or when the tool fails, the pane prints the message, keeps the annotations on disk, and waits for Enter before closing.
 
 Exit codes, per-tool collection channels, delivery rules, and the retention rules for kept output are in [docs/how-it-works.md](docs/how-it-works.md).
@@ -123,7 +123,7 @@ Exit codes, per-tool collection channels, delivery rules, and the retention rule
 | [revdiff](https://github.com/umputun/revdiff) | `brew install umputun/apps/revdiff` |
 | [tuicr](https://github.com/agavra/tuicr)      | `brew install tuicr`                |
 
-The catalog is fixed and not user-configurable. Tools are detected on the `PATH` of the herdr daemon: a tool counts as installed when an executable file with its name is found there, scanned in order. There is no per-tool override variable; if a tool is missing, install it and restart herdr so the daemon's `PATH` picks it up. The install commands are brew-first — the setup dialog and the not-found errors show them verbatim. On Linux, install the Rust tools with `cargo install <id>` (`tuicr`, `lumen`); revdiff has no cargo crate, so use its [release binaries](https://github.com/umputun/revdiff/releases) or build from source.
+The catalog is fixed and not user-configurable. Tools are detected on the `PATH` of the herdr daemon: a tool counts as installed when an executable file with its name is found there, scanned in order. The action opens the only installed tool directly, opens a picker for multiple tools, and opens setup when none are installed. There is no per-tool override variable; if a tool is missing, install it and restart herdr so the daemon's `PATH` picks it up. The install commands are brew-first — the setup dialog and the not-found errors show them verbatim. On Linux, install the Rust tools with `cargo install <id>` (`tuicr`, `lumen`); revdiff has no cargo crate, so use its [release binaries](https://github.com/umputun/revdiff/releases) or build from source.
 
 ### Review scope
 
@@ -140,21 +140,19 @@ On `nothing to review` the pane prints the line and waits for Enter before closi
 
 ### Configuration
 
-The review tool and the review pane's placement come from `config.toml` in the plugin config directory (`herdr plugin config-dir alexeyco.review`; the `HERDR_PLUGIN_CONFIG_DIR` variable wins when set). Flat keys, read once per launch:
+The review pane's placement and direction come from `config.toml` in the plugin config directory (`herdr plugin config-dir alexeyco.review`; the `HERDR_PLUGIN_CONFIG_DIR` variable wins when set). Tool choice comes from the installed catalog, not config. Flat keys, read once per launch:
 
-| Key         | Values                                        | Meaning                                     |
-| ----------- | --------------------------------------------- | ------------------------------------------- |
-| `tool`      | `revdiff`, `tuicr`, `lumen`                   | The review tool that runs; unset by default |
-| `placement` | `tab` (default), `split`, `overlay`, `zoomed` | Where the review pane opens                 |
-| `direction` | `right` (default), `down`, `auto`             | Split direction; `auto` lets herdr choose   |
+| Key         | Values                                        | Meaning                                   |
+| ----------- | --------------------------------------------- | ----------------------------------------- |
+| `placement` | `tab` (default), `split`, `overlay`, `zoomed` | Where the review pane opens               |
+| `direction` | `right` (default), `down`, `auto`             | Split direction; `auto` lets herdr choose |
 
 ```toml
-tool = "revdiff"
 placement = "split"
 direction = "down"
 ```
 
-`direction` applies only to `split`; any other placement ignores it. `placement = "popup"` is refused with a warning — the review pane is a workspace pane and `popup` is not among the placements the herdr CLI documents — and falls back to `tab`. A `tool` value outside the catalog warns and counts as unset, which routes the launch to the setup dialog. Every config problem (missing file, corrupt TOML, an unknown value) degrades to the defaults with a warning; a bad config never blocks the launch.
+`direction` applies only to `split`; any other placement ignores it. `placement = "popup"` is refused with a warning and falls back to `tab`. The obsolete `tool` key is ignored. Config problems (missing file, corrupt TOML, or an unknown value) degrade to the defaults with a warning; a bad config never blocks the launch.
 
 ## Why
 
@@ -167,7 +165,7 @@ direction = "down"
 ## Requirements
 
 - herdr >= 0.9.0
-- The review tool you configure, with the binary on the `PATH` of the herdr daemon (per-tool minimum versions: [docs/how-it-works.md](docs/how-it-works.md))
+- At least one catalog tool installed on the `PATH` of the herdr daemon (per-tool minimum versions: [docs/how-it-works.md](docs/how-it-works.md))
 - Rust toolchain 1.96.1 (the plugin builds itself on install)
 
 Release binaries are unsigned. macOS may quarantine them on first run; `xattr -d com.apple.quarantine <path>` clears the quarantine flag until the binaries are signed and notarized.
@@ -178,11 +176,11 @@ The plugin was renamed — plugin id `revdiff` → `alexeyco.review`, action `re
 
 1. **Rebind your key**: the action target is now `alexeyco.review.open`, not `revdiff.review`.
 2. **Re-register the plugin**: `herdr plugin install alexeyco/herdr-review` (or `herdr plugin link .` in a dev checkout) so the manifest with the new id is registered; the old `revdiff` registration stops being used.
-3. **Set your tool**: add `tool = "<id>"` — one of `revdiff`, `tuicr`, `lumen` — to the plugin's `config.toml` (see [Configuration](#configuration)). The keys are unchanged; the file now lives at `~/.config/herdr/plugins/config/alexeyco.review/config.toml`. Without a usable tool the action opens the setup dialog instead of a review.
+3. **Install a review tool**: install one or more catalog tools on herdr's `PATH`. The action selects the sole installed tool directly or lets you choose when several are installed; without any supported tool it opens the setup dialog.
 4. **`REVDIFF_BIN` is removed.** Tool binaries are resolved from `PATH` only; the variable is never read. Install revdiff on the herdr daemon's `PATH` instead.
 5. **State moved to the new plugin id**: annotation files now live under `~/.local/state/herdr/plugins/alexeyco.review/reviews/`. Kept files under the old `revdiff` state directory are no longer read or pruned; they were ephemeral, so deleting the old directory is safe.
 
-No migration tooling is shipped: kept annotation files are ephemeral (7-day prune), and the plugin keeps no other persistent state.
+No migration tooling is shipped: kept annotation files are ephemeral (7-day prune), and the plugin remembers the last selected tool in its state directory.
 
 ## Development
 

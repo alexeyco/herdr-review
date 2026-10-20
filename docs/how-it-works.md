@@ -1,10 +1,31 @@
 # How it works
 
-The `alexeyco.review.open` action is a small Rust program (sources under `src/`) that runs in three modes.
+The `alexeyco.review.open` action is a small Rust program (sources under `src/`) that runs in four modes.
 
-- **Action mode** runs when herdr invokes the `alexeyco.review.open` action. herdr sets `HERDR_PLUGIN_ACTION_ID` and `HERDR_PLUGIN_CONTEXT_JSON`; the binary resolves a repository directory and the caller identity from that JSON, reads `config.toml` once, and decides: a configured tool detected on `PATH` opens the review pane directly (`herdr plugin pane open --plugin alexeyco.review --entrypoint review ...`), otherwise the setup popup opens (`herdr plugin pane open --plugin alexeyco.review --entrypoint setup --placement popup --focus`). Then it exits immediately.
-- **Setup mode** (`HERDR_PLUGIN_ENTRYPOINT_ID=setup`) runs inside that popup, which the action opens only when no usable tool is configured. herdr spawns the manifest command as a process attached to the pane pty. The dialog resolves the config directory for its path line, shows the one universal layout — the config file path, the three catalog rows with their install commands, and the repository URL — and closes on any key. It never opens a review pane.
+- **Action mode** runs when herdr invokes the `alexeyco.review.open` action. herdr sets `HERDR_PLUGIN_ACTION_ID` and `HERDR_PLUGIN_CONTEXT_JSON`; the binary resolves a repository directory and caller identity, reads placement/direction config once, discovers installed catalog tools on `PATH`, and routes by count: zero opens setup, one opens review directly, and multiple open the picker. Then it exits immediately.
+- **Setup mode** (`HERDR_PLUGIN_ENTRYPOINT_ID=setup`) runs inside the popup opened when no catalog tool is installed. The dialog resolves the config directory for its path line, shows the config file path, the three catalog rows with install commands, and the repository URL, then closes on any key. It never opens a review pane.
+- **Picker mode** (`HERDR_PLUGIN_ENTRYPOINT_ID=picker`) runs in a compact popup when multiple catalog tools are installed. It receives the installed tool ids and launch context from the action, restores the last choice, and opens the review pane only after Enter. Esc exits without launching.
 - **Review-pane mode** (`HERDR_PLUGIN_ENTRYPOINT_ID=review`) runs inside the review pane. It probes git read-only to pick a scope, runs the chosen review tool as a direct child on the pane tty, collects the tool's annotations (revdiff's output file, tuicr's review session, lumen's stdout export), converts them to the canonical block format, and delivers them to the agent pane that requested the review.
+
+## Installed tool selection architecture
+
+```mermaid
+flowchart TD
+    Action[Review action] --> Catalog[PATH tool catalog]
+    Catalog -->|0 installed| Setup[Setup popup]
+    Catalog -->|1 installed| Review[Review pane]
+    Catalog -->|2 or more installed| Picker[Picker popup]
+    Action -->|installed ids and launch context| Picker
+    Picker -->|restore and save| State[last-review-tool state]
+    Picker -->|Enter: selected tool and context| Review
+    Picker -->|schedule after opening| FocusHelper[Close popup, then re-focus tab]
+    FocusHelper --> Review
+    Picker -->|Esc| Close[Close without launching]
+    Config[config.toml: placement and direction] --> Action
+    Review --> Herdr[Herdr CLI adapter]
+```
+
+The action owns PATH discovery and count-based routing. The picker owns keyboard selection and last-choice persistence; it receives the installed ids and launch context from the action, then calls the Herdr CLI adapter only after Enter. After the review pane opens, a detached helper closes the modal popup through the socket API, then calls `tab focus` for the new tab; this prevents popup teardown from restoring focus to the previous tab. The setup popup remains a separate no-tool path. Both popups use terminal-default colors and basic text attributes without reading herdr theme configuration. The picker has no internal frame, uses a 38-cell outer popup width to leave 36 cells for its footer, and highlights the selected row across the full content width.
 
 Plugin pane commands are argv-exec, not send-text: the manifest `command` array is spawned directly, so there is no shell layer, no echoed command line, and the review tool's TUI appears the instant the pane opens. Plugin panes also auto-close when the pane process exits, so the error and no-agent paths block on Enter before returning.
 
@@ -14,15 +35,17 @@ All three catalog tools — revdiff, tuicr, lumen — are human diff-review TUIs
 
 `main` picks the mode from the environment, in this order:
 
-| Condition                                      | Mode                                                                 |
-| ---------------------------------------------- | -------------------------------------------------------------------- |
-| `HERDR_PLUGIN_ENTRYPOINT_ID` = `review`        | Review-pane mode                                                     |
-| `HERDR_PLUGIN_ENTRYPOINT_ID` = `setup`         | Setup-dialog mode                                                    |
-| `HERDR_PLUGIN_ENTRYPOINT_ID` = anything else   | Error: `unknown plugin entrypoint <value>; expected review or setup` |
-| entrypoint unset, `HERDR_PLUGIN_ACTION_ID` set | Action mode                                                          |
-| neither                                        | Error: `invoked outside herdr plugin context` (exit 1)               |
+| Condition                                            | Mode                                                                          |
+| ---------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `HERDR_PLUGIN_ENTRYPOINT_ID` = `review`              | Review-pane mode                                                              |
+| `HERDR_PLUGIN_ENTRYPOINT_ID` = `setup`               | Setup-dialog mode                                                             |
+| `HERDR_PLUGIN_ENTRYPOINT_ID` = `picker`              | Picker mode                                                                   |
+| `HERDR_PLUGIN_ENTRYPOINT_ID` = anything else         | Error: `unknown plugin entrypoint <value>; expected review, setup, or picker` |
+| entrypoint unset, `HERDR_PLUGIN_ACTION_ID` set       | Action mode                                                                   |
+| neither                                              | Error: `invoked outside herdr plugin context` (exit 1)                        |
+| `HERDR_REVIEWS_INTERNAL_MODE` = `focus-after-picker` | Detached helper: close popup, then focus the selected review tab              |
 
-The entry point is checked first, so pane modes win when both variables are set, matching herdr's action-spawns-pane nesting. For both variables, a blank or whitespace-only value counts as unset.
+`HERDR_REVIEWS_INTERNAL_MODE` is checked first for the detached focus helper; otherwise the entry point is checked before the action id, so pane modes win when both are set. Blank or whitespace-only entry-point and action-id values count as unset.
 
 Errors in either pane mode print `herdr-review: <message>`, print `herdr-review: press Enter to close`, and block on one stdin line before exiting 1, so the auto-closing pane stays readable. Action-mode errors exit immediately. Exit codes are always 0 or 1 — a review tool's exit code (including revdiff's annotations code 10) is an internal outcome, never the binary's exit status.
 
@@ -30,21 +53,24 @@ Errors in either pane mode print `herdr-review: <message>`, print `herdr-review:
 
 Environment variables set by herdr or injected by this plugin (see the [plugin docs](https://herdr.dev/docs/plugins/)):
 
-| Variable                                                  | Used for                                                                                                                |
-| --------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
-| `HERDR_PLUGIN_ACTION_ID`                                  | Dispatch: action mode                                                                                                   |
-| `HERDR_PLUGIN_ENTRYPOINT_ID`                              | Dispatch: `review` or `setup` pane mode                                                                                 |
-| `HERDR_PLUGIN_CONTEXT_JSON`                               | Action mode: source of the repository directory and the caller pane/agent/tab; must be present                          |
-| `HERDR_BIN_PATH`                                          | Every callback (`plugin pane open`, `plugin config-dir`, `plugin pane close`, `tab close`, `tab focus`, `agent prompt`) |
-| `HERDR_PLUGIN_STATE_DIR`                                  | Base directory for review state (`reviews/`); the system temp directory when unset                                      |
-| `HERDR_PLUGIN_CONFIG_DIR`                                 | Config directory for `config.toml`; wins over the `plugin config-dir` CLI call                                          |
-| `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, `HERDR_TAB_ID`     | Action mode: fallbacks for `workspace_id` / `focused_pane_id` / `tab_id` when the context JSON omits them               |
-| `HERDR_REVIEWS_DIR`                                       | Review directory, injected by the action; review-pane mode prefers it over its cwd                                      |
-| `HERDR_REVIEWS_CALLER_PANE`, `HERDR_REVIEWS_CALLER_AGENT` | Injected by the action; review-pane mode: delivery target                                                               |
-| `HERDR_REVIEWS_CALLER_TAB`                                | Injected by the action; review-pane mode: the focus-return target after a clean ending                                  |
-| `HERDR_REVIEW_TOOL`                                       | Review-pane mode: the selected tool id (`revdiff`, `tuicr`, or `lumen`)                                                 |
-| `HERDR_TAB_ID`, `HERDR_PANE_ID`                           | Review-pane mode: pane teardown (close pane, then tab)                                                                  |
-| `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`                    | Set by herdr but unused by this plugin                                                                                  |
+| Variable                                                                                                         | Used for                                                                                                                   |
+| ---------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
+| `HERDR_PLUGIN_ACTION_ID`                                                                                         | Dispatch: action mode                                                                                                      |
+| `HERDR_PLUGIN_ENTRYPOINT_ID`                                                                                     | Dispatch: `review`, `setup`, or `picker` pane mode                                                                         |
+| `HERDR_PLUGIN_CONTEXT_JSON`                                                                                      | Action mode: source of the repository directory and the caller pane/agent/tab; must be present                             |
+| `HERDR_BIN_PATH`                                                                                                 | Every callback (`plugin pane open`, `plugin config-dir`, `plugin pane close`, `tab close`, `tab focus`, `agent prompt`)    |
+| `HERDR_PLUGIN_STATE_DIR`                                                                                         | Base directory for review output (`reviews/`) and picker choice (`last-review-tool`); the system temp directory when unset |
+| `HERDR_PLUGIN_CONFIG_DIR`                                                                                        | Config directory for `config.toml`; wins over the `plugin config-dir` CLI call                                             |
+| `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, `HERDR_TAB_ID`                                                            | Action mode: fallbacks for `workspace_id` / `focused_pane_id` / `tab_id` when the context JSON omits them                  |
+| `HERDR_REVIEWS_DIR`                                                                                              | Review directory, injected by the action; review-pane mode prefers it over its cwd                                         |
+| `HERDR_REVIEWS_CALLER_PANE`, `HERDR_REVIEWS_CALLER_AGENT`                                                        | Injected by the action; review-pane mode: delivery target                                                                  |
+| `HERDR_REVIEWS_CALLER_TAB`                                                                                       | Injected by the action; review-pane mode: the focus-return target after a clean ending                                     |
+| `HERDR_REVIEW_TOOL`                                                                                              | Review-pane mode: the selected tool id (`revdiff`, `tuicr`, or `lumen`)                                                    |
+| `HERDR_REVIEWS_PICKER_TOOL_IDS`                                                                                  | Picker mode: comma-separated ids of installed catalog tools                                                                |
+| `HERDR_REVIEWS_PLACEMENT`, `HERDR_REVIEWS_DIRECTION`                                                             | Picker mode: action's placement and direction settings for the eventual review pane                                        |
+| `HERDR_REVIEWS_WORKSPACE`, `HERDR_REVIEWS_CALLER_PANE`, `HERDR_REVIEWS_CALLER_AGENT`, `HERDR_REVIEWS_CALLER_TAB` | Picker mode: launch context forwarded by the action for the selected review pane                                           |
+| `HERDR_TAB_ID`, `HERDR_PANE_ID`                                                                                  | Review-pane mode: pane teardown (close pane, then tab)                                                                     |
+| `HERDR_PLUGIN_ID`, `HERDR_PLUGIN_ROOT`                                                                           | Set by herdr but unused by this plugin                                                                                     |
 
 Fields read from the context JSON in action mode (all optional; absent when null or blank):
 
@@ -87,11 +113,11 @@ Resolution failures are loud:
 - `<tool> not found on PATH; install it with <install command>` when no entry yields a binary.
 - `found <tool> at <candidate> but cannot resolve it to an absolute path: <err>` when canonicalization fails; the path is shown as given.
 
-The action uses this detection for the direct-open decision on the configured `tool` id; a non-executable file with the tool's name does not count. The setup dialog runs no detection at all — its rows are static.
+The action routes by the number of detected tools: zero opens setup, one opens the review pane directly, and two or more open the picker. A non-executable file with a tool's name does not count. The setup dialog runs no detection — its install rows are static.
 
 ## The setup dialog
 
-The action opens the setup popup — `herdr plugin pane open --plugin alexeyco.review --entrypoint setup --placement popup --focus`, with no `--cwd` and no `--env` pairs (the herdr 0.9.5 daemon also rejects popup opens that target a workspace) — only when no usable tool is configured: the `tool` key unset or blank, an invalid value the config layer already degraded to unset, or a valid id whose binary is not on `PATH`. No review pane opens in that case.
+The action opens the setup popup — `herdr plugin pane open --plugin alexeyco.review --entrypoint setup --placement popup --focus`, with no `--cwd` and no `--env` pairs — only when no catalog tool is installed. No review pane opens in that case.
 
 The dialog shows **one universal layout** for every entry case. It runs no PATH detection and reads no config content — no line states which case occurred — and its only environment interaction is resolving the config directory (`HERDR_PLUGIN_CONFIG_DIR`, else the `herdr plugin config-dir alexeyco.review` CLI call) for the path line. The content, as rendered (every content line carries a two-column left padding; the install commands render dim after the tool names):
 
@@ -100,7 +126,7 @@ The dialog shows **one universal layout** for every entry case. It runs no PATH 
   Config file:
   <config dir>/config.toml — or the `herdr plugin config-dir alexeyco.review` hint when nothing resolves
 (blank line)
-  Add one of these tools to config:
+  Install one of these review tools:
   lumen    brew install jnsahaj/lumen/lumen
   revdiff  brew install umputun/apps/revdiff
   tuicr    brew install tuicr
@@ -111,11 +137,11 @@ The dialog shows **one universal layout** for every entry case. It runs no PATH 
 enter/q/esc close
 ```
 
-- No internal title: the popup window already shows the manifest pane title. One blank line sits above the content, the help footer is pinned to the bottom of the drawable area with blank filler lines (the terminal size is re-read from `stty size` on every redraw, 80×24 fallback), and the frame ends without a trailing newline.
-- Every content line starts with the two-column left padding, and the full-width panel-background fill acts as the right padding — top, left, and right all get breathing room. The rows are static and alphabetical (`lumen`, `revdiff`, `tuicr`), each with its install command dim on the same line after a two-column gap; the repository URL line closes the content. The manifest declares the popup size (`width = "60%"`, `height = 15`), which fits the thirteen-line content budget — blank top, eleven content lines, footer — plus a two-row wrap margin with no scrolling; a machine-dependent config path longer than the popup width wraps onto extra visual lines and the margin keeps up to two of them visible with the footer still pinned last (the path stays copy-typable from the command the hint names).
-- Colors come from the herdr theme palette: `[theme] name` in the herdr config (`$HERDR_CONFIG_PATH` else `~/.config/herdr/config.toml`), resolved once per dialog run, with the ANSI-16 palette on any resolution failure (unset, unreadable, invalid, or unknown name).
+- No internal title: the popup window already shows the manifest pane title. One blank line sits above the content, and the help footer is pinned to the bottom of the drawable area with blank filler lines. Ratatui uses the current backend frame size for each redraw.
+- The rows are static and alphabetical (`lumen`, `revdiff`, `tuicr`), each with its install command dim on the same line after a two-column gap; the repository URL line closes the content. The manifest declares the popup size (`width = "60%"`, `height = 15`), which fits the content and a two-row wrap margin for long config paths.
+- The dialog uses terminal-default colors and basic text attributes. It does not read the herdr theme configuration.
 - The dialog is read-only and closes on any key: `Enter`, `q`, and `Esc` each close it — exit 0, the popup auto-closes, no `plugin pane open` call is made, and no file is written anywhere. There are no movement keys and no highlighted row.
-- The key reader uses a ~0.1 s read timeout (`stty min 0 time 1`), so a lone Escape is told apart from a closed terminal.
+- In a terminal, the dialog uses Ratatui's terminal backend and closes on any key event. With non-interactive stdin, it prints the same guidance as plain text and reads one byte before exiting.
 
 ## Placement and tool config
 
@@ -123,21 +149,20 @@ The action reads `config.toml` from the plugin config directory exactly once per
 
 | Key         | Values                              | Default |
 | ----------- | ----------------------------------- | ------- |
-| `tool`      | `revdiff`, `tuicr`, `lumen`         | unset   |
 | `placement` | `tab`, `split`, `overlay`, `zoomed` | `tab`   |
 | `direction` | `right`, `down`, `auto`             | `right` |
 
-`tool` decides the launch: a valid id selects the review tool the action checks against `PATH` for the direct open; an unset or blank value is silent and routes the launch to the setup dialog; any other value prints one `herdr-review: warning: invalid tool in config.toml: "<value>"; expected one of revdiff, tuicr, lumen; treating it as unset` warning and is treated as unset. `direction` is passed as `--direction <value>` only when the placement is `split` (`right`/`down` only — the herdr CLI accepts exactly those two); `auto`, an unset key, or a non-split placement omit the flag. `placement = "popup"` is refused — the review pane is a workspace pane and `popup` is not among the placements the herdr CLI documents — printing `herdr-review: warning: placement "popup" is not supported for the review pane; using "tab"` and using `tab`. Every other failure (no config directory, missing or unreadable file, corrupt TOML, an invalid value) prints one `herdr-review: warning:` line and degrades to defaults; the launch never fails on config. Unknown keys are ignored.
+The obsolete `tool` key is ignored; installed tool discovery is the only source of available choices. `direction` is passed as `--direction <value>` only when the placement is `split` (`right`/`down` only — the herdr CLI accepts exactly those two); `auto`, an unset key, or a non-split placement omit the flag. `placement = "popup"` is refused for the review pane with a warning and falls back to `tab`. Config problems warn and degrade to defaults; they never fail the launch.
 
 ## Launch and lifecycle
 
 ### Action mode
 
 1. Parse the context JSON, resolve the repository directory and the caller identity (see [Context](#context)).
-2. Read `config.toml` once (see [Placement and tool config](#placement-and-tool-config)).
-3. Decide: the configured `tool` id, checked against `PATH` with the catalog's detection rules.
+2. Read `config.toml` once for placement and direction (see [Placement and tool config](#placement-and-tool-config)).
+3. Discover installed catalog tools on `PATH`.
 
-   **Usable** — the direct open, the main path:
+   **Exactly one tool** — open the review pane directly with that id:
 
    ```
    herdr plugin pane open --plugin alexeyco.review --entrypoint review --placement <placement> \
@@ -151,7 +176,7 @@ The action reads `config.toml` from the plugin config directory exactly once per
 
    `--direction` appears only for `split` with a right/down direction. `--target-pane <caller-pane>` (the resolved caller pane) appears only for `split` and `zoomed` — the daemon rejects those placements without a target — and when no caller pane resolved the action warns `herdr-review: warning: placement "<placement>" needs a caller pane; using "tab"` and degrades to `tab` before the open, so no `--direction` and no `--target-pane` reach the argv. `--workspace <workspace_id>` appears only for `tab` (the daemon rejects it on every pane-anchored placement); `overlay`, `split`, and `zoomed` opens carry no workspace targeting at all. The reply is parsed best-effort: exit status 0 already means the pane exists, so a non-blank `result.plugin_pane.pane.pane_id` just enables the success log line (`herdr-review: opened review pane <pane>` or `... in tab <tab>` followed by a best-effort `herdr tab focus <tab>`), while an unparsable reply logs `herdr-review: warning: cannot parse review pane open reply: <snippet>` (200 characters) and still succeeds.
 
-   **Not usable** (unset, blank, invalid and degraded to unset, or valid but missing from `PATH`) — the setup popup:
+   **No tools installed** — open the setup popup:
 
    ```
    herdr plugin pane open --plugin alexeyco.review --entrypoint setup --placement popup --focus
@@ -159,9 +184,15 @@ The action reads `config.toml` from the plugin config directory exactly once per
 
    No `--workspace`, no `--cwd`, no `--env` pairs: the dialog resolves the config path itself and needs nothing else forwarded, and the herdr 0.9.5 daemon rejects popup opens that target a workspace. Success is the herdr exit status alone — a popup reply carries no pane id, and the reply body is not parsed. Log `herdr-review: opened review tool setup` to stderr (visible via `herdr plugin log list`) and exit 0. No focus calls, no hold.
 
+   **Multiple tools installed** — open the picker popup at its manifest size (`width = 38`, `height = 7`) and pass the installed ids plus the review launch context. The picker uses Up/Down to move, Enter to open the selected tool, and Esc to exit without launching. Its state file is `last-review-tool` under `HERDR_PLUGIN_STATE_DIR`; a missing or unavailable choice falls back to the first installed tool, and state read/write errors do not prevent launch.
+
 ### Setup-dialog mode
 
 The pane resolves the config directory for its path line (see [The setup dialog](#the-setup-dialog)), draws the one universal dialog, and waits for one key. Any of `Enter`, `q`, and `Esc` closes it: the process exits 0, the popup auto-closes, no herdr call is made, and nothing is written. A terminal failure (raw mode, drawing, restore) is an error, which the pane-mode error policy holds.
+
+### Picker mode
+
+The picker requires an interactive terminal. Without one, it reports that selection is unavailable and exits without launching. It has no internal border, uses terminal-default colors, highlights the selected row across the full width, and does not read theme configuration. The 38-cell outer popup leaves 36 cells for the footer. The selected tool and review launch context travel to the review pane only after Enter. A detached helper closes the popup and re-focuses the new tab after popup teardown.
 
 ### Review-pane mode
 
@@ -333,7 +364,7 @@ The context is parsed by [`serde_json`](https://crates.io/crates/serde_json) int
 
 - **`no directory in plugin context`** — the action ran without workspace context. Invoke it from inside a herdr workspace (e.g. via the keybinding), not from a bare shell.
 - **`invoked outside herdr plugin context`** — the binary was run directly, without `HERDR_PLUGIN_ACTION_ID` or `HERDR_PLUGIN_ENTRYPOINT_ID`. Invoke it through herdr.
-- **`unknown plugin entrypoint <value>`** — the manifest or the pane-open call named an entrypoint other than `review` or `setup`.
+- **`unknown plugin entrypoint <value>`** — the manifest or pane-open call named an entrypoint other than `review`, `setup`, or `picker`.
 - **`<tool> not found on PATH`** — the selected tool is not on the `PATH` of the pane process (the herdr daemon's environment). Install it (the error and the setup dialog's rows both show the install command) and restart herdr. There is no override variable; `REVDIFF_BIN` no longer exists.
 - **`herdr-review: nothing to review`** — the scope resolved to nothing: not a repo, no commits, a detached HEAD on a clean tree, or a clean tree with no `origin/HEAD` / `origin/main` / `origin/master`. Commit or fetch a base, or dirty the tree.
 - **Empty review** — the reviewed diff follows the current git state (see [Scope selection](#scope-selection)); when that diff is empty, the tool exits cleanly with no annotations, the plugin logs `no annotations`, and nothing is delivered. A mixed staged+unstaged tree is reviewed as uncommitted changes, so the staged-only portion is not shown separately.
@@ -344,6 +375,6 @@ The context is parsed by [`serde_json`](https://crates.io/crates/serde_json) int
 - **A tool fails to start** — the pane prints `herdr-review: reviewing <description>` and the error (for example `failed to run <bin> in <dir>: <err>`), then waits for Enter. Fix the cause and re-run the action; check the action side with `herdr plugin log list --plugin alexeyco.review`.
 - **`herdr did not provide HERDR_BIN_PATH (plugin API v1 contract)`** — the process was not given the herdr binary path it needs for callbacks. Run the plugin through herdr rather than directly, and check the herdr install.
 - **`placement "popup" is not supported for the review pane`** — a `config.toml` warning, not a failure: the review pane is a workspace pane and `popup` is not a documented placement for it, so the pane opened as a tab instead.
-- **The setup dialog appears instead of a review pane** — the `tool` key is unset, blank, invalid, or names a tool missing from the daemon's `PATH`. Add `tool = "<id>"` to the config file the dialog prints, install the named tool, and re-run the action. The dialog itself is the same for every one of these cases — it names no state.
+- **The setup dialog appears instead of a review pane** — no catalog tool is installed on the daemon's `PATH`. Install one of the tools listed in the dialog and re-run the action. With one installed tool the action opens it directly; with several it opens the picker.
 - **The action appears hung** — herdr CLI calls (`plugin pane`, `plugin config-dir`, `tab`, `agent`) have no timeout by design in plugin API v1, so a hung herdr daemon blocks the action; check the daemon first.
 - Action logs: `herdr plugin log list --plugin alexeyco.review`.
