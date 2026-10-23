@@ -32,7 +32,16 @@ pub(super) fn child_argv(
 pub(super) fn revdiff_argv(bin: &str, out_path: &str, scope: &Scope) -> Vec<String> {
     let fragments = scope.fragments(ReviewTool::Revdiff);
     let (leading, trailing): (&[String], &[String]) = match scope {
-        Scope::Uncommitted => (&fragments, &[]),
+        Scope::Uncommitted {
+            staged: true,
+            unstaged,
+            untracked,
+        } if *unstaged || *untracked => {
+            let split = usize::from(*untracked);
+            (&fragments[..split], &fragments[split..])
+        }
+        Scope::Uncommitted { .. } | Scope::AllFiles => (&fragments, &[]),
+        Scope::CleanCommitted { .. } => (&[], &[]),
         Scope::VsBase(_) | Scope::NothingToReview => (&[], &fragments),
     };
     let mut argv = vec![bin.to_string()];

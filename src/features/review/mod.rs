@@ -193,16 +193,17 @@ impl ReviewPane<'_> {
         reports: &Path,
         resolve_bin: impl FnOnce() -> Result<String, String>,
     ) -> Result<(), String> {
-        let scope = self.repository.scope();
+        let scope = self.repository.scope().for_tool(tool);
         match &scope {
             // A failed probe already printed its warning; either way no tool runs
             // and no output file is created — hold the pane and exit cleanly.
-            Scope::NothingToReview => {
+            Scope::NothingToReview | Scope::CleanCommitted { .. } => {
                 println!("herdr-review: nothing to review");
                 hold_pane();
                 return Ok(());
             }
-            Scope::Uncommitted => println!("herdr-review: reviewing uncommitted changes"),
+            Scope::Uncommitted { .. } => println!("herdr-review: reviewing uncommitted changes"),
+            Scope::AllFiles => println!("herdr-review: reviewing all files"),
             Scope::VsBase(base) => println!("herdr-review: reviewing vs {base}"),
         }
 

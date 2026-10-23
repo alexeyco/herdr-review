@@ -156,7 +156,116 @@ fn revdiff_child_argv_keeps_the_fixed_trailing_flags() {
     // Scenario "revdiff argv keeps the fixed trailing flags": the scope
     // flag before the fixed pair, the scope positionals last.
     assert_eq!(
-        revdiff_argv("/bin/revdiff", "/s/1.out", &Scope::Uncommitted),
+        revdiff_argv(
+            "/bin/revdiff",
+            "/s/1.out",
+            &Scope::Uncommitted {
+                staged: false,
+                unstaged: true,
+                untracked: false
+            }
+        ),
+        [
+            "/bin/revdiff",
+            "--output",
+            "/s/1.out",
+            "--exit-code-on-annotations"
+        ]
+    );
+    assert_eq!(
+        revdiff_argv(
+            "/bin/revdiff",
+            "/s/1.out",
+            &Scope::Uncommitted {
+                staged: true,
+                unstaged: false,
+                untracked: false
+            }
+        ),
+        [
+            "/bin/revdiff",
+            "--staged",
+            "--output",
+            "/s/1.out",
+            "--exit-code-on-annotations"
+        ]
+    );
+    assert_eq!(
+        revdiff_argv(
+            "/bin/revdiff",
+            "/s/1.out",
+            &Scope::Uncommitted {
+                staged: true,
+                unstaged: true,
+                untracked: false
+            }
+        ),
+        [
+            "/bin/revdiff",
+            "--output",
+            "/s/1.out",
+            "--exit-code-on-annotations",
+            "HEAD"
+        ]
+    );
+    assert_eq!(
+        revdiff_argv(
+            "/bin/revdiff",
+            "/s/1.out",
+            &Scope::Uncommitted {
+                staged: true,
+                unstaged: false,
+                untracked: true
+            }
+        ),
+        [
+            "/bin/revdiff",
+            "--untracked",
+            "--output",
+            "/s/1.out",
+            "--exit-code-on-annotations",
+            "HEAD"
+        ]
+    );
+    assert_eq!(
+        revdiff_argv(
+            "/bin/revdiff",
+            "/s/1.out",
+            &Scope::Uncommitted {
+                staged: true,
+                unstaged: true,
+                untracked: true
+            }
+        ),
+        [
+            "/bin/revdiff",
+            "--untracked",
+            "--output",
+            "/s/1.out",
+            "--exit-code-on-annotations",
+            "HEAD"
+        ]
+    );
+    assert_eq!(
+        revdiff_argv("/bin/revdiff", "/s/1.out", &Scope::AllFiles),
+        [
+            "/bin/revdiff",
+            "--all-files",
+            "--output",
+            "/s/1.out",
+            "--exit-code-on-annotations"
+        ]
+    );
+    assert_eq!(
+        revdiff_argv(
+            "/bin/revdiff",
+            "/s/1.out",
+            &Scope::Uncommitted {
+                staged: false,
+                unstaged: false,
+                untracked: true
+            }
+        ),
         [
             "/bin/revdiff",
             "--untracked",
@@ -198,7 +307,11 @@ fn child_argv_per_tool() {
             ReviewTool::Tuicr,
             "/bin/tuicr",
             "/s/1.out",
-            &Scope::Uncommitted
+            &Scope::Uncommitted {
+                staged: false,
+                unstaged: true,
+                untracked: false
+            }
         ),
         ["/bin/tuicr", "-w"]
     );
@@ -216,7 +329,11 @@ fn child_argv_per_tool() {
             ReviewTool::Lumen,
             "/bin/lumen",
             "/s/1.out",
-            &Scope::Uncommitted
+            &Scope::Uncommitted {
+                staged: false,
+                unstaged: true,
+                untracked: false
+            }
         ),
         ["/bin/lumen", "diff"]
     );
@@ -297,7 +414,11 @@ fn tuicr_child_argv_reaches_the_child() {
         ReviewTool::Tuicr,
         &bin.to_string_lossy(),
         "/s/1.out",
-        &Scope::Uncommitted,
+        &Scope::Uncommitted {
+            staged: false,
+            unstaged: true,
+            untracked: false,
+        },
     );
     let child = spawn_child(ReviewTool::Tuicr, &argv, dir.path()).unwrap();
     assert_eq!(child.code, Some(1));
@@ -318,7 +439,11 @@ fn lumen_stdout_is_piped_and_captured() {
         ReviewTool::Lumen,
         &bin.to_string_lossy(),
         "/s/1.out",
-        &Scope::Uncommitted,
+        &Scope::Uncommitted {
+            staged: false,
+            unstaged: true,
+            untracked: false,
+        },
     );
     let child = spawn_child(ReviewTool::Lumen, &argv, dir.path()).unwrap();
     assert_eq!(child.code, Some(1));
@@ -505,7 +630,11 @@ fn nonzero_lumen_exit_keeps_raw_capture() {
         ReviewTool::Lumen,
         &bin.to_string_lossy(),
         "/s/1.out",
-        &Scope::Uncommitted,
+        &Scope::Uncommitted {
+            staged: false,
+            unstaged: true,
+            untracked: false,
+        },
     );
     let child = spawn_child(ReviewTool::Lumen, &argv, dir.path()).unwrap();
     let run = PaneRun {
@@ -573,7 +702,11 @@ fn nonzero_tuicr_exit_skips_the_adapter_and_keeps_the_empty_file() {
         ReviewTool::Tuicr,
         &bin.to_string_lossy(),
         "/s/1.out",
-        &Scope::Uncommitted,
+        &Scope::Uncommitted {
+            staged: false,
+            unstaged: true,
+            untracked: false,
+        },
     );
     let child = spawn_child(ReviewTool::Tuicr, &argv, dir.path()).unwrap();
     std::fs::write(&out, "").unwrap();
@@ -824,7 +957,11 @@ fn pane_uses_repository_and_runner_ports() {
     repository
         .expect_scope()
         .times(1)
-        .return_const(Scope::Uncommitted);
+        .return_const(Scope::Uncommitted {
+            staged: false,
+            unstaged: true,
+            untracked: false,
+        });
     let mut runner = MockReviewToolRunner::new();
     runner
         .expect_run()

@@ -13,7 +13,18 @@ use crate::adapters::tool::ReviewTool;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Scope {
     /// Staged, unstaged, and/or untracked changes exist.
-    Uncommitted,
+    Uncommitted {
+        staged: bool,
+        unstaged: bool,
+        untracked: bool,
+    },
+    /// A committed repository has no staged, unstaged, or untracked changes.
+    CleanCommitted {
+        detached: bool,
+        base: Option<String>,
+    },
+    /// revdiff's browse-all mode for a clean committed repository.
+    AllFiles,
     /// A clean tree with an attached HEAD and a base ref to review against.
     VsBase(String),
     /// Nothing reviewable: not a repo, no commits, a detached HEAD, no base,
@@ -27,24 +38,65 @@ impl Scope {
     ///
     /// | Scope            | revdiff               | tuicr                | lumen                 |
     /// | ---------------- | --------------------- | -------------------- | --------------------- |
-    /// | `Uncommitted`    | `--untracked`         | `-w`                 | (none)                |
+    /// | `Uncommitted`    | status-dependent      | `-w`                 | (none)                |
+    /// | `AllFiles`       | `--all-files`         | (none)               | (none)                |
     /// | `VsBase(<base>)` | `<base> HEAD`         | `-r <base>..HEAD`    | `<base>...HEAD`       |
     ///
-    /// For revdiff the `Uncommitted` fragment is a flag (the spawn builder
-    /// places it before the fixed trailing flags) while `VsBase`'s are the
-    /// two positional refs (placed after them); the other tools consume one
-    /// plain list.
+    /// Revdiff flags precede its fixed output flags; positional refs follow
+    /// them. The other tools consume one plain list.
     pub(crate) fn fragments(&self, tool: ReviewTool) -> Vec<String> {
         match (self, tool) {
-            (Scope::Uncommitted, ReviewTool::Revdiff) => vec!["--untracked".to_string()],
-            (Scope::Uncommitted, ReviewTool::Tuicr) => vec!["-w".to_string()],
-            (Scope::Uncommitted, ReviewTool::Lumen) => Vec::new(),
+            (
+                Scope::Uncommitted {
+                    staged,
+                    unstaged,
+                    untracked,
+                },
+                ReviewTool::Revdiff,
+            ) => {
+                if *staged {
+                    if *unstaged || *untracked {
+                        let mut args = Vec::new();
+                        if *untracked {
+                            args.push("--untracked".to_string());
+                        }
+                        args.push("HEAD".to_string());
+                        args
+                    } else {
+                        vec!["--staged".to_string()]
+                    }
+                } else if *untracked {
+                    vec!["--untracked".to_string()]
+                } else {
+                    Vec::new()
+                }
+            }
+            (Scope::Uncommitted { .. }, ReviewTool::Tuicr) => vec!["-w".to_string()],
+            (Scope::Uncommitted { .. }, ReviewTool::Lumen) => Vec::new(),
+            (Scope::AllFiles, ReviewTool::Revdiff) => vec!["--all-files".to_string()],
+            (Scope::AllFiles, _) => Vec::new(),
+            (Scope::CleanCommitted { .. }, _) => Vec::new(),
             (Scope::VsBase(base), ReviewTool::Revdiff) => vec![base.clone(), "HEAD".to_string()],
             (Scope::VsBase(base), ReviewTool::Tuicr) => {
                 vec!["-r".to_string(), format!("{base}..HEAD")]
             }
             (Scope::VsBase(base), ReviewTool::Lumen) => vec![format!("{base}...HEAD")],
             (Scope::NothingToReview, _) => Vec::new(),
+        }
+    }
+
+    pub(crate) fn for_tool(&self, tool: ReviewTool) -> Self {
+        match self {
+            Scope::CleanCommitted { detached, base } => match tool {
+                ReviewTool::Revdiff => Scope::AllFiles,
+                ReviewTool::Tuicr | ReviewTool::Lumen => {
+                    if !detached && let Some(base) = base {
+                        return Scope::VsBase(base.clone());
+                    }
+                    Scope::NothingToReview
+                }
+            },
+            scope => scope.clone(),
         }
     }
 }
@@ -105,11 +157,15 @@ pub(crate) fn select_scope(s: &GitStatus) -> Scope {
         return Scope::NothingToReview;
     }
     if s.unstaged || s.staged || s.untracked {
-        return Scope::Uncommitted;
+        return Scope::Uncommitted {
+            staged: s.staged,
+            unstaged: s.unstaged,
+            untracked: s.untracked,
+        };
     }
-    match (s.detached, &s.base) {
-        (false, Some(base)) => Scope::VsBase(base.clone()),
-        _ => Scope::NothingToReview,
+    Scope::CleanCommitted {
+        detached: s.detached,
+        base: s.base.clone(),
     }
 }
 
@@ -386,33 +442,57 @@ mod tests {
                 ..repo_with_head()
             },
         ] {
-            assert_eq!(select_scope(&s), Scope::Uncommitted);
+            assert_eq!(
+                select_scope(&s),
+                Scope::Uncommitted {
+                    staged: s.staged,
+                    unstaged: s.unstaged,
+                    untracked: s.untracked,
+                }
+            );
         }
     }
 
     #[test]
-    fn clean_tree_with_base_selects_vs_base() {
+    fn clean_tree_with_base_selects_clean_committed_scope() {
         let s = GitStatus {
             base: Some("origin/main".to_string()),
             ..repo_with_head()
         };
-        assert_eq!(select_scope(&s), Scope::VsBase("origin/main".to_string()));
+        assert_eq!(
+            select_scope(&s),
+            Scope::CleanCommitted {
+                detached: false,
+                base: Some("origin/main".to_string())
+            }
+        );
     }
 
     #[test]
-    fn clean_tree_without_base_selects_nothing_to_review() {
-        assert_eq!(select_scope(&repo_with_head()), Scope::NothingToReview);
+    fn clean_tree_without_base_selects_clean_committed_scope() {
+        assert_eq!(
+            select_scope(&repo_with_head()),
+            Scope::CleanCommitted {
+                detached: false,
+                base: None,
+            }
+        );
     }
 
     #[test]
-    fn detached_head_on_clean_tree_selects_nothing_to_review() {
-        // Detached wins even when a base branch exists.
+    fn detached_head_on_clean_tree_selects_clean_committed_scope() {
         let s = GitStatus {
             detached: true,
             base: Some("origin/main".to_string()),
             ..repo_with_head()
         };
-        assert_eq!(select_scope(&s), Scope::NothingToReview);
+        assert_eq!(
+            select_scope(&s),
+            Scope::CleanCommitted {
+                detached: true,
+                base: Some("origin/main".to_string()),
+            }
+        );
     }
 
     #[test]
@@ -434,12 +514,97 @@ mod tests {
     #[test]
     fn uncommitted_fragments_per_tool() {
         // Scenario "Uncommitted fragments per tool".
+        let staged_only = Scope::Uncommitted {
+            staged: true,
+            unstaged: false,
+            untracked: false,
+        };
+        let mixed = Scope::Uncommitted {
+            staged: true,
+            unstaged: true,
+            untracked: false,
+        };
+        let staged_and_untracked = Scope::Uncommitted {
+            staged: true,
+            unstaged: false,
+            untracked: true,
+        };
+        let all_three = Scope::Uncommitted {
+            staged: true,
+            unstaged: true,
+            untracked: true,
+        };
+        let untracked_only = Scope::Uncommitted {
+            staged: false,
+            unstaged: false,
+            untracked: true,
+        };
+        let unstaged_only = Scope::Uncommitted {
+            staged: false,
+            unstaged: true,
+            untracked: false,
+        };
+        assert_eq!(staged_only.fragments(ReviewTool::Revdiff), ["--staged"]);
+        assert_eq!(mixed.fragments(ReviewTool::Revdiff), ["HEAD"]);
         assert_eq!(
-            Scope::Uncommitted.fragments(ReviewTool::Revdiff),
+            staged_and_untracked.fragments(ReviewTool::Revdiff),
+            ["--untracked", "HEAD"]
+        );
+        assert_eq!(
+            all_three.fragments(ReviewTool::Revdiff),
+            ["--untracked", "HEAD"]
+        );
+        assert_eq!(
+            untracked_only.fragments(ReviewTool::Revdiff),
             ["--untracked"]
         );
-        assert_eq!(Scope::Uncommitted.fragments(ReviewTool::Tuicr), ["-w"]);
-        assert!(Scope::Uncommitted.fragments(ReviewTool::Lumen).is_empty());
+        assert!(unstaged_only.fragments(ReviewTool::Revdiff).is_empty());
+        assert_eq!(staged_only.fragments(ReviewTool::Tuicr), ["-w"]);
+        assert!(staged_only.fragments(ReviewTool::Lumen).is_empty());
+        assert_eq!(
+            Scope::AllFiles.fragments(ReviewTool::Revdiff),
+            ["--all-files"]
+        );
+        assert_eq!(
+            Scope::CleanCommitted {
+                detached: false,
+                base: Some("origin/main".to_string())
+            }
+            .for_tool(ReviewTool::Revdiff),
+            Scope::AllFiles
+        );
+        assert_eq!(
+            Scope::CleanCommitted {
+                detached: false,
+                base: Some("origin/main".to_string())
+            }
+            .for_tool(ReviewTool::Tuicr),
+            Scope::VsBase("origin/main".to_string())
+        );
+        assert_eq!(
+            Scope::CleanCommitted {
+                detached: true,
+                base: Some("origin/main".to_string())
+            }
+            .for_tool(ReviewTool::Lumen),
+            Scope::NothingToReview
+        );
+        assert_eq!(
+            Scope::CleanCommitted {
+                detached: false,
+                base: None,
+            }
+            .for_tool(ReviewTool::Revdiff),
+            Scope::AllFiles
+        );
+        assert_eq!(
+            Scope::CleanCommitted {
+                detached: false,
+                base: None,
+            }
+            .for_tool(ReviewTool::Tuicr),
+            Scope::NothingToReview
+        );
         assert!(
             Scope::NothingToReview
                 .fragments(ReviewTool::Revdiff)
@@ -499,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_clean_tree_with_origin_main_selects_vs_base() {
+    fn probe_clean_tree_with_origin_main_selects_clean_committed_scope() {
         let dir = TempDir::new("origin-main");
         init_and_commit(dir.path(), "a.txt", "a\n");
         add_origin_main(dir.path());
@@ -516,32 +681,47 @@ mod tests {
         );
         assert_eq!(
             select_scope(&status),
-            Scope::VsBase("origin/main".to_string())
+            Scope::CleanCommitted {
+                detached: false,
+                base: Some("origin/main".to_string())
+            }
         );
     }
 
     #[test]
-    fn probe_clean_tree_without_base_selects_nothing_to_review() {
+    fn probe_clean_tree_without_base_selects_clean_committed_scope() {
         let dir = TempDir::new("no-base");
         init_and_commit(dir.path(), "a.txt", "a\n");
         second_commit(dir.path());
         let status = probe(dir.path());
         assert_eq!(status, repo_with_head());
-        assert_eq!(select_scope(&status), Scope::NothingToReview);
+        assert_eq!(
+            select_scope(&status),
+            Scope::CleanCommitted {
+                detached: false,
+                base: None
+            }
+        );
     }
 
     #[test]
-    fn probe_detached_head_selects_nothing_to_review() {
+    fn probe_detached_head_selects_clean_committed_scope() {
         let dir = TempDir::new("detached");
         init_and_commit(dir.path(), "a.txt", "a\n");
         add_origin_main(dir.path());
         second_commit(dir.path());
         git(dir.path(), &["checkout", "-q", "--detach"]);
         let status = probe(dir.path());
-        // The base still resolves, but a detached HEAD holds.
+        // The base still resolves, but the tool-aware mapping decides whether to hold.
         assert!(status.detached);
         assert_eq!(status.base.as_deref(), Some("origin/main"));
-        assert_eq!(select_scope(&status), Scope::NothingToReview);
+        assert_eq!(
+            select_scope(&status),
+            Scope::CleanCommitted {
+                detached: true,
+                base: Some("origin/main".to_string())
+            }
+        );
     }
 
     #[test]
@@ -562,7 +742,14 @@ mod tests {
                 ..GitStatus::default()
             }
         );
-        assert_eq!(select_scope(&status), Scope::Uncommitted);
+        assert_eq!(
+            select_scope(&status),
+            Scope::Uncommitted {
+                staged: false,
+                unstaged: true,
+                untracked: false,
+            }
+        );
     }
 
     #[test]
@@ -581,7 +768,14 @@ mod tests {
                 ..GitStatus::default()
             }
         );
-        assert_eq!(select_scope(&status), Scope::Uncommitted);
+        assert_eq!(
+            select_scope(&status),
+            Scope::Uncommitted {
+                staged: true,
+                unstaged: false,
+                untracked: false,
+            }
+        );
     }
 
     #[test]
@@ -599,7 +793,14 @@ mod tests {
                 ..GitStatus::default()
             }
         );
-        assert_eq!(select_scope(&status), Scope::Uncommitted);
+        assert_eq!(
+            select_scope(&status),
+            Scope::Uncommitted {
+                staged: false,
+                unstaged: false,
+                untracked: true,
+            }
+        );
     }
 
     #[test]
@@ -769,7 +970,14 @@ mod tests {
                 sg.calls(),
                 [IS_REPO, VERIFY_HEAD, DIFF, DIFF_CACHED, LS_OTHERS]
             );
-            assert_eq!(select_scope(&status), Scope::Uncommitted);
+            assert_eq!(
+                select_scope(&status),
+                Scope::Uncommitted {
+                    staged: true,
+                    unstaged: true,
+                    untracked: true
+                }
+            );
         }
 
         #[test]
@@ -802,7 +1010,10 @@ mod tests {
             );
             assert_eq!(
                 select_scope(&status),
-                Scope::VsBase("origin/main".to_string())
+                Scope::CleanCommitted {
+                    detached: false,
+                    base: Some("origin/main".to_string())
+                }
             );
         }
 
@@ -835,7 +1046,13 @@ mod tests {
                     VERIFY_ORIGIN_MASTER,
                 ]
             );
-            assert_eq!(select_scope(&status), Scope::NothingToReview);
+            assert_eq!(
+                select_scope(&status),
+                Scope::CleanCommitted {
+                    detached: false,
+                    base: None
+                }
+            );
         }
 
         #[test]
@@ -852,7 +1069,13 @@ mod tests {
             let status = probe_with(&sg).unwrap();
             assert!(status.detached);
             assert_eq!(status.base.as_deref(), Some("origin/HEAD"));
-            assert_eq!(select_scope(&status), Scope::NothingToReview);
+            assert_eq!(
+                select_scope(&status),
+                Scope::CleanCommitted {
+                    detached: true,
+                    base: Some("origin/HEAD".to_string())
+                }
+            );
         }
 
         #[test]
