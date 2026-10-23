@@ -431,8 +431,7 @@ fn clean_repo(dir: &Path) {
 }
 
 /// A clean repo whose `origin` remote has an `origin/main` ref one commit
-/// behind HEAD, so the probe selects `VsBase(origin/main)` and revdiff gets
-/// the two positional refs.
+/// behind HEAD, for clean-tree tool-specific scope selection.
 fn clean_repo_with_origin_main(dir: &Path) {
     clean_repo(dir);
     git(
@@ -561,7 +560,7 @@ fn pane_rc10_delivers_annotations_and_closes_pane() {
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(
-        stdout(&out).contains("herdr-review: reviewing vs origin/main"),
+        stdout(&out).contains("herdr-review: reviewing all files"),
         "stdout: {}",
         stdout(&out)
     );
@@ -580,12 +579,9 @@ fn pane_rc10_delivers_annotations_and_closes_pane() {
     // Scenario "Delivered run refocuses the caller tab": the focus return
     // runs before the pane close attempt, with the forwarded caller tab.
     assert_focus_then_close(&logged, "tab focus w3X:t9", "plugin pane close pane-7");
-    // Two positional refs at the end of the argv, never a `..` range argument.
-    assert!(
-        revdiff_line(&logged).ends_with("origin/main HEAD"),
-        "{}",
-        logged
-    );
+    // A clean committed repository uses revdiff's all-files browsing mode.
+    assert!(revdiff_line(&logged).contains("--all-files"), "{}", logged);
+    assert!(!revdiff_line(&logged).contains("origin/main"), "{logged}");
     assert!(out_files(&state.join("reviews")).is_empty());
 }
 
@@ -896,7 +892,55 @@ fn pane_untracked_repo_passes_untracked() {
 }
 
 #[test]
-fn pane_clean_repo_without_remote_holds_nothing_to_review() {
+fn pane_mixed_staged_and_unstaged_uses_head_base() {
+    let fx = Fixture::new("mixed-staged-unstaged");
+    let repo = fx.subdir("repo");
+    clean_repo(&repo);
+    fs::write(repo.join("a.txt"), "staged\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    fs::write(repo.join("a.txt"), "unstaged\n").unwrap();
+    let (herdr, log) = fx.stubs();
+    let state = fx.subdir("state");
+    let path = fx.path_with_stubs();
+
+    let mut env = pane_env(&repo, &state, &herdr, &log, &path);
+    env.push(("REV_EMPTY", "1"));
+    let out = run_plugin(&env);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let logged = read_log(&log);
+    let args = revdiff_line(&logged);
+    assert!(args.contains("--exit-code-on-annotations HEAD"), "{logged}");
+    assert!(!args.contains("--staged"), "{logged}");
+    assert!(!args.contains("--untracked"), "{logged}");
+}
+
+#[test]
+fn pane_staged_and_untracked_uses_head_and_untracked() {
+    let fx = Fixture::new("staged-and-untracked");
+    let repo = fx.subdir("repo");
+    clean_repo(&repo);
+    fs::write(repo.join("a.txt"), "staged\n").unwrap();
+    git(&repo, &["add", "a.txt"]);
+    fs::write(repo.join("new.txt"), "untracked\n").unwrap();
+    let (herdr, log) = fx.stubs();
+    let state = fx.subdir("state");
+    let path = fx.path_with_stubs();
+
+    let mut env = pane_env(&repo, &state, &herdr, &log, &path);
+    env.push(("REV_EMPTY", "1"));
+    let out = run_plugin(&env);
+
+    assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
+    let logged = read_log(&log);
+    let args = revdiff_line(&logged);
+    assert!(args.contains("--untracked --output"), "{logged}");
+    assert!(args.ends_with("HEAD"), "{logged}");
+    assert!(!args.contains("--staged"), "{logged}");
+}
+
+#[test]
+fn pane_clean_repo_without_remote_reviews_all_files() {
     let fx = Fixture::new("nothing-to-review");
     let repo = fx.subdir("repo");
     clean_repo(&repo);
@@ -904,24 +948,24 @@ fn pane_clean_repo_without_remote_holds_nothing_to_review() {
     let state = fx.subdir("state");
     let path = fx.path_with_stubs();
 
-    let env = pane_env(&repo, &state, &herdr, &log, &path);
+    let mut env = pane_env(&repo, &state, &herdr, &log, &path);
+    env.push(("REV_EMPTY", "1"));
     let out = run_plugin(&env);
 
     assert_eq!(out.status.code(), Some(0), "stderr: {}", stderr(&out));
     assert!(
-        stdout(&out).contains("herdr-review: nothing to review"),
+        stdout(&out).contains("herdr-review: reviewing all files"),
         "stdout: {}",
         stdout(&out)
     );
     assert!(
-        stderr(&out).contains("herdr-review: press Enter to close"),
-        "stderr: {}",
+        !stderr(&out).contains("herdr-review: press Enter to close"),
+        "{}",
         stderr(&out)
     );
     let logged = read_log(&log);
-    assert!(!logged.contains("REVDIFF"), "{logged}");
-    // Nothing to review exits before any state-dir work.
-    assert!(!state.join("reviews").exists());
+    assert!(revdiff_line(&logged).contains("--all-files"), "{logged}");
+    assert!(state.join("reviews").exists());
 }
 
 #[test]

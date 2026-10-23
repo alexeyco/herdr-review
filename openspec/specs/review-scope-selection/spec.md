@@ -116,11 +116,14 @@ stdout from `ls-files --others` means untracked files exist;
 
 From the probed git state the plugin SHALL select exactly one scope with a
 pure function: non-repo or repo without HEAD → `NothingToReview`; any
-staged, unstaged, or untracked changes → `Uncommitted`; otherwise (clean
-tree) → `VsBase(<base>)` when a base from the chain resolved and HEAD is
-attached, else `NothingToReview`. Pane mode SHALL announce the selected
-scope on stdout and, for `NothingToReview`, hold the pane and exit 0
-without spawning a tool or creating an output file.
+staged, unstaged, or untracked changes → `Uncommitted`; otherwise a clean
+repository with HEAD → `CleanCommitted`, preserving whether HEAD is
+detached and the resolved base (if any). Before announcing or launching, the
+pane SHALL map `CleanCommitted` by tool: revdiff → `AllFiles`; tuicr and
+lumen → `VsBase(<base>)` when HEAD is attached and a base resolved, else
+`NothingToReview`. Pane mode SHALL announce the selected scope on stdout
+and, for `NothingToReview`, hold the pane and exit 0 without spawning a tool
+or creating an output file.
 
 #### Scenario: Dirty tree reviews uncommitted changes
 
@@ -134,21 +137,23 @@ reviewing uncommitted changes`
 
 - **WHEN** the probe reports a clean tree, an attached HEAD, and
   `origin/main` as the first base that verifies
-- **THEN** `VsBase(origin/main)` is selected and stdout shows
+- **THEN** `CleanCommitted` is selected; revdiff announces that it is
+  reviewing all files, while tuicr and lumen announce
   `herdr-review: reviewing vs origin/main`
 
-#### Scenario: Clean tree without any base holds
+#### Scenario: Clean tree without any base is tool-specific
 
 - **WHEN** the tree is clean and none of `origin/HEAD`, `origin/main`,
   `origin/master` verifies
-- **THEN** stdout shows `herdr-review: nothing to review`, the pane is
-  held, the process exits 0, and no tool is spawned
+- **THEN** revdiff announces that it is reviewing all files; tuicr and
+  lumen show `herdr-review: nothing to review`, hold, and do not spawn
 
-#### Scenario: Detached HEAD on a clean tree holds
+#### Scenario: Detached HEAD on a clean tree is tool-specific
 
 - **WHEN** the tree is clean and `git symbolic-ref -q HEAD` reports a
   detached HEAD
-- **THEN** the scope is `NothingToReview` even when a base branch exists
+- **THEN** revdiff announces that it is reviewing all files; tuicr and
+  lumen select `NothingToReview` even when a base branch exists
 
 #### Scenario: Non-repo directory holds
 
@@ -164,20 +169,70 @@ reviewing uncommitted changes`
 
 ### Requirement: Scope maps to per-tool argv fragments
 
-Each scope SHALL expose a static argv fragment per catalog tool, consumed
-by reviewer-execution: `Uncommitted` → revdiff `--untracked`, tuicr `-w`,
-lumen nothing; `VsBase(<base>)` → revdiff positionals `<base> HEAD` (two
-refs, no flags), tuicr `-r <base>..HEAD`, lumen positional
+Each scope SHALL expose argv fragments per catalog tool, consumed by
+reviewer-execution. `Uncommitted` SHALL preserve staged, unstaged, and
+untracked state. Staged-only changes SHALL map to revdiff `--staged`. When
+staged changes coexist with unstaged or untracked changes, revdiff SHALL
+use positional `HEAD` to compare the working tree with the commit and SHALL
+add `--untracked` only when untracked files exist. Unstaged-only changes
+SHALL use revdiff's default working-tree diff; untracked-only changes
+SHALL add `--untracked`. tuicr gets `-w`, and lumen gets no scope flags.
+`AllFiles` SHALL map to revdiff `--all-files`. `VsBase(<base>)` SHALL map to revdiff positionals
+`<base> HEAD` (two refs, no flags), tuicr `-r <base>..HEAD`, and lumen
 `<base>...HEAD`. revdiff positionals are placed after its fixed trailing
-flags.
+flags, and revdiff scope flags before them.
 Evidence: `revdiff --help → against: second git ref for two-ref diff`; the
 README documents `<base>..HEAD` as equivalent.
 
 #### Scenario: Uncommitted fragments per tool
 
-- **WHEN** the scope is `Uncommitted`
-- **THEN** the fragments are `["--untracked"]` for revdiff, `["-w"]` for
-  tuicr, and `[]` for lumen
+- **WHEN** the scope is `Uncommitted` with no staged or untracked changes
+- **THEN** revdiff uses its default working-tree diff, tuicr gets `["-w"]`, and
+  lumen gets `[]`
+
+#### Scenario: Staged-only changes map to the staged flag
+
+- **WHEN** the scope has staged changes and no unstaged or untracked changes
+- **THEN** revdiff gets `["--staged"]` without `--untracked`
+
+#### Scenario: Mixed staged and working-tree changes map to both categories
+
+- **WHEN** the scope has staged changes and also unstaged changes or
+  untracked files
+- **THEN** revdiff gets the positional base `HEAD`, which includes staged
+  and unstaged tracked changes
+
+#### Scenario: Mixed staged and untracked changes map to HEAD and untracked
+
+- **WHEN** the scope has staged changes and untracked files
+- **THEN** revdiff gets positional base `HEAD` and `--untracked`
+
+#### Scenario: Mixed staged, unstaged, and untracked changes map to all categories
+
+- **WHEN** the scope has staged changes, unstaged changes, and untracked files
+- **THEN** revdiff gets positional base `HEAD` and `--untracked`
+
+#### Scenario: Unstaged-only changes use the default working-tree diff
+
+- **WHEN** the scope has unstaged changes and no staged or untracked changes
+- **THEN** revdiff uses its default working-tree diff without `--staged` or
+  `--untracked`
+
+#### Scenario: Untracked-only changes include untracked files
+
+- **WHEN** the scope has untracked files and no staged or unstaged changes
+- **THEN** revdiff gets `--untracked` without `--staged`
+
+#### Scenario: Other tool mappings remain unchanged
+
+- **WHEN** any `Uncommitted` scope is mapped for tuicr or lumen
+- **THEN** tuicr gets `["-w"]` and lumen gets `[]`
+
+#### Scenario: Clean committed repository lets revdiff browse all files
+
+- **WHEN** the scope is `CleanCommitted`
+- **THEN** revdiff gets `["--all-files"]`, regardless of branch attachment
+  or whether a base resolved
 
 #### Scenario: Vs-base fragments per tool
 
