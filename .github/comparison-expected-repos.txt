@@ -1,0 +1,1 @@
+persiyanov/herdr-reviewr@v0.49.0,jhochenbaum/herdr-hunk-diff@v0.5.0,JanSmrcka/differ@v1.8.1,quantk/herdr-review@v0.2.7,skellleks/lasso@v0.1.0

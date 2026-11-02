@@ -13,9 +13,9 @@
 // Fixture READMEs are tiny table-markup-free documents: presence checks
 // are substring searches, so the release-cell text appears WITHOUT an
 // http scheme and therefore never joins the liveness URL set — check
-// mode stays fully offline. Fixture workflow files carry a single
-// EXPECT_REPOS: line. Every case spawns the script as a child process
-// with --readme/--workflow/--report/--summary/--report-issue always
+// mode stays fully offline. Fix-mode fixtures use a plain expectations
+// file. Every case spawns the script as a child process
+// with --readme/--expectations/--report/--summary/--report-issue always
 // pointing into a temp dir; the repo-root files are never touched.
 //
 // Run: node --test tests/comparison.test.mjs
@@ -707,7 +707,7 @@ test("GITHUB_TOKEN is sent as a Bearer header on the release GET", async (t) => 
 
 // ── Fix mode ─────────────────────────────────────────────────────────────────
 
-test("fix updates the README cell and the env line together", async (t) => {
+test("fix updates the README cell and the expectations file together", async (t) => {
   await withFixture(t, async (ctx) => {
     route(ctx, "GET", "/repos/jhochenbaum/herdr-hunk-diff/releases/latest", {
       status: 200,
@@ -723,21 +723,10 @@ test("fix updates the README cell and the env line together", async (t) => {
         "",
       ].join("\n"),
     );
-    const workflow = fixture(
-      ctx,
-      "workflow.yml",
-      [
-        "name: fixture",
-        "jobs:",
-        "  check:",
-        "    env:",
-        "      EXPECT_REPOS: jhochenbaum/herdr-hunk-diff@v0.5.0",
-        "",
-      ].join("\n"),
-    );
+    const expectations = fixture(ctx, "expectations.txt", "jhochenbaum/herdr-hunk-diff@v0.5.0\n");
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "jhochenbaum/herdr-hunk-diff@v0.5.0" },
     );
     assert.equal(out.status, 0);
@@ -748,10 +737,10 @@ test("fix updates the README cell and the env line together", async (t) => {
       "the README cell carries the live tag in the anchored shape",
     );
     assert.ok(
-      readFileSync(workflow, "utf8").includes(
-        "EXPECT_REPOS: jhochenbaum/herdr-hunk-diff@v0.6.0",
+      readFileSync(expectations, "utf8").includes(
+        "jhochenbaum/herdr-hunk-diff@v0.6.0",
       ),
-      "the env line carries the live tag",
+      "the expectations file carries the live tag",
     );
   });
 });
@@ -785,18 +774,11 @@ test("fix never touches matrix cells or the checked-date line", async (t) => {
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", original);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      EXPECT_REPOS: jhochenbaum/herdr-hunk-diff@v0.5.0",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
+    const expectationsOriginal = "jhochenbaum/herdr-hunk-diff@v0.5.0\n";
+    const expectations = fixture(ctx, "expectations.txt", expectationsOriginal);
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "jhochenbaum/herdr-hunk-diff@v0.5.0" },
     );
     assert.equal(out.status, 0);
@@ -809,8 +791,8 @@ test("fix never touches matrix cells or the checked-date line", async (t) => {
     assert.ok(fixed.includes(dateLine));
     assert.ok(fixed.includes("⚠️"));
     assert.equal(
-      readFileSync(workflow, "utf8"),
-      workflowOriginal.replace(
+      readFileSync(expectations, "utf8"),
+      expectationsOriginal.replace(
         "jhochenbaum/herdr-hunk-diff@v0.5.0",
         "jhochenbaum/herdr-hunk-diff@v0.6.0",
       ),
@@ -836,18 +818,11 @@ test("fix skips a 404 entry and converges the others", async (t) => {
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", original);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      EXPECT_REPOS: alpha/one@v0.5.0,beta/two@v1.0.0",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
+    const expectationsOriginal = "alpha/one@v0.5.0,beta/two@v1.0.0\n";
+    const expectations = fixture(ctx, "expectations.txt", expectationsOriginal);
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "alpha/one@v0.5.0,beta/two@v1.0.0" },
     );
     assert.equal(out.status, 0);
@@ -859,8 +834,8 @@ test("fix skips a 404 entry and converges the others", async (t) => {
       "the 404 entry's cell stays untouched, the other converges",
     );
     assert.equal(
-      readFileSync(workflow, "utf8"),
-      workflowOriginal.replace(
+      readFileSync(expectations, "utf8"),
+      expectationsOriginal.replace(
         "alpha/one@v0.5.0,beta/two@v1.0.0",
         "alpha/one@v0.5.0,beta/two@v2.0.0",
       ),
@@ -887,18 +862,11 @@ test("fix skips an unmatchable cell and the run stays green", async (t) => {
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", original);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      EXPECT_REPOS: alpha/one@v1.0.0,beta/two@v1.0.0",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
+    const expectationsOriginal = "alpha/one@v1.0.0,beta/two@v1.0.0\n";
+    const expectations = fixture(ctx, "expectations.txt", expectationsOriginal);
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "alpha/one@v1.0.0,beta/two@v1.0.0" },
     );
     assert.equal(out.status, 0);
@@ -910,8 +878,8 @@ test("fix skips an unmatchable cell and the run stays green", async (t) => {
       original.replace(cell("alpha/one", "v1.0.0"), cell("alpha/one", "v2.0.0")),
     );
     assert.equal(
-      readFileSync(workflow, "utf8"),
-      workflowOriginal.replace(
+      readFileSync(expectations, "utf8"),
+      expectationsOriginal.replace(
         "alpha/one@v1.0.0,beta/two@v1.0.0",
         "alpha/one@v2.0.0,beta/two@v1.0.0",
       ),
@@ -941,30 +909,23 @@ test("fix is atomic when a live source is unreachable", async (t) => {
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", original);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      EXPECT_REPOS: alpha/one@v1.0.0,beta/two@v1.0.0",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
+    const expectationsOriginal = "alpha/one@v1.0.0,beta/two@v1.0.0\n";
+    const expectations = fixture(ctx, "expectations.txt", expectationsOriginal);
 
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "alpha/one@v1.0.0,beta/two@v1.0.0" },
     );
     assert.equal(out.status, 2);
     assert.equal(readFileSync(readme, "utf8"), original);
-    assert.equal(readFileSync(workflow, "utf8"), workflowOriginal);
+    assert.equal(readFileSync(expectations, "utf8"), expectationsOriginal);
 
     // The whole seam on a literal closed port: same atomic outcome.
     const deadApi = await closedPortApi();
     const deadOut = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       {
         EXPECT_REPOS: "alpha/one@v1.0.0,beta/two@v1.0.0",
         COMPARISON_GITHUB_API: deadApi,
@@ -972,11 +933,11 @@ test("fix is atomic when a live source is unreachable", async (t) => {
     );
     assert.equal(deadOut.status, 2);
     assert.equal(readFileSync(readme, "utf8"), original);
-    assert.equal(readFileSync(workflow, "utf8"), workflowOriginal);
+    assert.equal(readFileSync(expectations, "utf8"), expectationsOriginal);
   });
 });
 
-test("a missing EXPECT_REPOS line (or workflow file) is loud", async (t) => {
+test("a missing expectations file is loud", async (t) => {
   await withFixture(t, async (ctx) => {
     route(ctx, "GET", "/repos/alpha/one/releases/latest", {
       status: 200,
@@ -989,39 +950,15 @@ test("a missing EXPECT_REPOS line (or workflow file) is loud", async (t) => {
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", readmeOriginal);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      OTHER: x",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
-
-    const out = await runScript(
-      ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
-      { EXPECT_REPOS: "alpha/one@v1.0.0" },
-    );
-    assert.equal(out.status, 2);
-    assert.ok(out.stdout.includes("✗"));
-    assert.ok(
-      out.stdout.includes(workflow),
-      "the ✗ line must name the workflow file",
-    );
-    assert.equal(readFileSync(readme, "utf8"), readmeOriginal);
-    assert.equal(readFileSync(workflow, "utf8"), workflowOriginal);
-
-    const missingWorkflow = join(ctx.tmp, "no-such-workflow.yml");
+    const missingExpectations = join(ctx.tmp, "no-such-expectations.txt");
     const missingOut = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", missingWorkflow],
+      ["--fix", "--readme", readme, "--expectations", missingExpectations],
       { EXPECT_REPOS: "alpha/one@v1.0.0" },
     );
     assert.equal(missingOut.status, 2);
     assert.ok(missingOut.stdout.includes("✗"));
-    assert.ok(missingOut.stdout.includes(missingWorkflow));
+    assert.ok(missingOut.stdout.includes(missingExpectations));
     assert.equal(readFileSync(readme, "utf8"), readmeOriginal);
   });
 });
@@ -1039,23 +976,16 @@ test("converged input leaves both files unchanged and exits zero", async (t) => 
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", original);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      EXPECT_REPOS: alpha/one@v2.0.0",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
+    const expectationsOriginal = "alpha/one@v2.0.0\n";
+    const expectations = fixture(ctx, "expectations.txt", expectationsOriginal);
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "alpha/one@v2.0.0" },
     );
     assert.equal(out.status, 0);
     assert.equal(readFileSync(readme, "utf8"), original);
-    assert.equal(readFileSync(workflow, "utf8"), workflowOriginal);
+    assert.equal(readFileSync(expectations, "utf8"), expectationsOriginal);
   });
 });
 
@@ -1072,18 +1002,11 @@ test("fix heals a hand-broken README cell when env and live agree", async (t) =>
       "",
     ].join("\n");
     const readme = fixture(ctx, "README.md", original);
-    const workflowOriginal = [
-      "name: fixture",
-      "jobs:",
-      "  check:",
-      "    env:",
-      "      EXPECT_REPOS: alpha/one@v2.0.0",
-      "",
-    ].join("\n");
-    const workflow = fixture(ctx, "workflow.yml", workflowOriginal);
+    const expectationsOriginal = "alpha/one@v2.0.0\n";
+    const expectations = fixture(ctx, "expectations.txt", expectationsOriginal);
     const out = await runScript(
       ctx,
-      ["--fix", "--readme", readme, "--workflow", workflow],
+      ["--fix", "--readme", readme, "--expectations", expectations],
       { EXPECT_REPOS: "alpha/one@v2.0.0" },
     );
     assert.equal(out.status, 0);
@@ -1092,7 +1015,7 @@ test("fix heals a hand-broken README cell when env and live agree", async (t) =>
       original.replace(cell("alpha/one", "v1.0.0"), cell("alpha/one", "v2.0.0")),
       "idempotent-convergent: a 200 answer rewrites the cell even when the env pin already matches",
     );
-    assert.equal(readFileSync(workflow, "utf8"), workflowOriginal);
+    assert.equal(readFileSync(expectations, "utf8"), expectationsOriginal);
   });
 });
 
