@@ -62,22 +62,12 @@ contract); cannot call back into herdr`
 
 ### Requirement: Read-only git probe
 
-The plugin SHALL probe the resolved directory by running, in order,
-`git rev-parse --is-inside-work-tree`, `git rev-parse -q --verify HEAD`,
-`git diff --quiet`, `git diff --cached --quiet`, and `git ls-files --others
---exclude-standard`, each with `current_dir(dir)`, and every command SHALL
-be read-only so the index and working tree are never mutated — no catalog
-tool may stage or mutate the branch either. Only when the tree is clean (no
-staged, unstaged, or untracked changes) the probe SHALL continue with
-`git symbolic-ref -q HEAD` (attached-branch check) and the base chain
-`git rev-parse -q --verify origin/HEAD`, then `origin/main`, then
-`origin/master`, stopping at the first base that verifies. The former
-`HEAD~1` probe is gone. Exit-code meanings are fixed:
-`--is-inside-work-tree` other than success with output `true` means
-non-repo (not an error); `rev-parse -q --verify` exit 0 means the revision
-exists; quiet diffs exit 0 for clean and 1 for changes; non-empty trimmed
-stdout from `ls-files --others` means untracked files exist;
-`symbolic-ref -q HEAD` nonzero means detached HEAD.
+The plugin SHALL use read-only git probes in the resolved directory to
+detect repository, HEAD, staged, unstaged, and untracked state. Only a
+clean tree proceeds to the attached-branch check and base lookup, in order:
+`origin/HEAD`, `origin/main`, then `origin/master`. Stop at the first valid
+base; do not use the former `HEAD~1` probe. Probe outcomes SHALL follow the
+documented exit-code meanings.
 
 #### Scenario: Probe stops early for a non-repo directory
 
@@ -114,16 +104,12 @@ stdout from `ls-files --others` means untracked files exist;
 
 ### Requirement: Two-phase scope selection
 
-From the probed git state the plugin SHALL select exactly one scope with a
-pure function: non-repo or repo without HEAD → `NothingToReview`; any
-staged, unstaged, or untracked changes → `Uncommitted`; otherwise a clean
-repository with HEAD → `CleanCommitted`, preserving whether HEAD is
-detached and the resolved base (if any). Before announcing or launching, the
-pane SHALL map `CleanCommitted` by tool: revdiff → `AllFiles`; tuicr and
-lumen → `VsBase(<base>)` when HEAD is attached and a base resolved, else
-`NothingToReview`. Pane mode SHALL announce the selected scope on stdout
-and, for `NothingToReview`, hold the pane and exit 0 without spawning a tool
-or creating an output file.
+The plugin SHALL select `NothingToReview` for non-repositories or missing HEAD,
+`Uncommitted` for dirty trees, and `CleanCommitted` otherwise. Preserve
+attachment and base state. Map clean scope to revdiff `AllFiles`; tuicr and
+lumen use `VsBase` only with attached HEAD and a resolved base, otherwise
+hold. Announce the scope; `NothingToReview` exits 0 without a tool or output
+file.
 
 #### Scenario: Dirty tree reviews uncommitted changes
 
@@ -169,20 +155,13 @@ reviewing uncommitted changes`
 
 ### Requirement: Scope maps to per-tool argv fragments
 
-Each scope SHALL expose argv fragments per catalog tool, consumed by
-reviewer-execution. `Uncommitted` SHALL preserve staged, unstaged, and
-untracked state. Staged-only changes SHALL map to revdiff `--staged`. When
-staged changes coexist with unstaged or untracked changes, revdiff SHALL
-use positional `HEAD` to compare the working tree with the commit and SHALL
-add `--untracked` only when untracked files exist. Unstaged-only changes
-SHALL use revdiff's default working-tree diff; untracked-only changes
-SHALL add `--untracked`. tuicr gets `-w`, and lumen gets no scope flags.
-`AllFiles` SHALL map to revdiff `--all-files`. `VsBase(<base>)` SHALL map to revdiff positionals
-`<base> HEAD` (two refs, no flags), tuicr `-r <base>..HEAD`, and lumen
-`<base>...HEAD`. revdiff positionals are placed after its fixed trailing
-flags, and revdiff scope flags before them.
-Evidence: `revdiff --help → against: second git ref for two-ref diff`; the
-README documents `<base>..HEAD` as equivalent.
+Each scope SHALL expose per-tool argv fragments. For revdiff, map
+staged-only to `--staged`, mixed staged and working-tree changes to
+positional `HEAD` with optional `--untracked`, unstaged-only to the default
+diff, untracked-only to `--untracked`, and clean committed scope to
+`--all-files`. tuicr and lumen retain their existing arguments. Explicit
+`VsBase` uses each tool's documented refs or range; order revdiff scope
+flags before fixed flags and refs after them.
 
 #### Scenario: Uncommitted fragments per tool
 

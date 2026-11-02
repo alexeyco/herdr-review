@@ -66,17 +66,11 @@ three are absent the action SHALL fail. (`src/context.rs:36-52`,
 
 ### Requirement: Caller identity fields are read from context with defined env fallbacks
 
-The action SHALL read `workspace_id`, `focused_pane_id`, and
-`focused_pane_agent` from the context JSON (blank or non-string counts as
-absent); `workspace_id` and `focused_pane_id` SHALL fall back to the
-environment variables `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID` respectively,
-and `focused_pane_agent` SHALL have no environment fallback.
-(`src/context.rs:25-30`, `src/review.rs:111-117`) The resolved values feed
-the action's own review-pane open directly — `--workspace <id>` for `tab`
-placement, `--target-pane <pane>` for `split`/`zoomed`, and the
-`HERDR_REVIEWS_CALLER_PANE` / `HERDR_REVIEWS_CALLER_AGENT` env pairs — with
-no popup forwarding hop; the action-time context is the only trusted source
-for caller identity.
+The action SHALL read workspace, pane, and agent identity from context;
+blank or non-string values count as absent. Workspace and pane ids fall
+back to `HERDR_WORKSPACE_ID` and `HERDR_PANE_ID`; the agent has no env
+fallback. Use the resolved identity directly when opening the pane, with
+no popup forwarding hop.
 
 #### Scenario: Pane id taken from the environment
 
@@ -95,24 +89,13 @@ for caller identity.
 
 ### Requirement: The review pane is opened through the herdr CLI with a fixed, ordered argv
 
-The review pane SHALL be opened by the action itself after selecting an
-installed catalog tool, invoking the herdr binary at `HERDR_BIN_PATH` with the
-argument vector `plugin pane open --plugin alexeyco.review --entrypoint
-review --placement <placement>`, then a conditional `--direction <direction>` (only
-when placement is `split` and direction resolves to `right` or `down`),
-then a conditional `--target-pane <pane>` (only for `split` and `zoomed`,
-from the resolved caller pane; without one those placements degrade to
-`tab` with a warning before the open, because the daemon rejects them
-targetless), then a conditional `--workspace <id>` (only when placement is
-`tab`; overlay takes no targeting flags — live-probed `invalid_params` on
-targeted non-tab opens), then `--cwd <dir>`, then always
-`--env HERDR_REVIEWS_DIR=<dir>` and `--env HERDR_REVIEW_TOOL=<tool>`, then
-conditional `--env HERDR_REVIEWS_CALLER_PANE=<pane>`,
-`--env HERDR_REVIEWS_CALLER_AGENT=<agent>`, and
-`--env HERDR_REVIEWS_CALLER_TAB=<tab>` (each only when that value is
-present), then `--focus`. `<placement>` and `<direction>` come from the
-placement-config capability; `<tool>` is the selected installed catalog id
-(`lumen`, `revdiff`, or `tuicr`).
+After selecting an installed tool, the action SHALL open the review pane
+through `HERDR_BIN_PATH` with `plugin pane open` and the selected placement.
+Preserve argv order: placement, optional split direction, optional pane
+target for split/zoomed, optional workspace for tab, cwd, required review
+directory/tool env, available caller env values, then `--focus`. Missing
+target pane degrades split/zoomed to tab with a warning; overlay has no
+target flags.
 
 #### Scenario: Resolved directory is passed twice
 
@@ -175,16 +158,11 @@ placement-config capability; `<tool>` is the selected installed catalog id
 
 ### Requirement: Success is reported on stderr and the action exits without holding
 
-On a successful direct open the action SHALL log `herdr-review: opened
-review pane {pane_id} in tab {tab}` followed by a best-effort
-`herdr tab focus <tab>` whose errors are ignored when a `tab_id` parsed, or
-`herdr-review: opened review pane {pane_id}` with no focus call when it is
-absent; an unparsable reply already warned and skips the log line. On a
-successful setup-popup open the action SHALL log `herdr-review: opened
-review tool setup` with no focus call. Either way the action exits 0
-without holding; failures follow the mode-dispatch capability's top-level
-error policy (printed with the `herdr-review:` prefix, exit 1, no hold in
-action mode).
+On direct-open success, the action SHALL log the pane and tab and
+best-effort refocus a parsed tab id; an unparsable reply warns and skips
+the log. Setup-popup success logs `herdr-review: opened review tool
+setup` without refocusing. Both paths exit 0 without holding; action
+errors follow mode-dispatch's top-level error policy.
 
 #### Scenario: Action success opens the popup and exits
 

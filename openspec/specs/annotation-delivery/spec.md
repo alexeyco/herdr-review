@@ -18,17 +18,11 @@ mechanics themselves belong to the mode-dispatch capability.
 
 ### Requirement: Review outcome is decided from exit code, output, and agent availability
 
-The pane process SHALL classify the tool's result into exactly one outcome,
-per tool. Annotations exist when: revdiff exits 10, or exits 0 with
-non-blank `.out` content; tuicr exits 0 and the session adapter yields a
-non-empty comment list; lumen exits 0 with non-blank captured stdout. When
-annotations exist the outcome is `Deliver` if a caller agent is available
-and `NoAgent` otherwise. A clean exit with nothing collected is
-`NoAnnotations`. Any other exit code is `Failed(rc)` even when output was
-collected. A caller agent is considered available only when both
-`HERDR_REVIEWS_CALLER_PANE` and `HERDR_REVIEWS_CALLER_AGENT` are non-blank
-in the pane environment (those variables are injected by the action on
-the review-pane open).
+The pane process SHALL classify each tool result as `Deliver`, `NoAgent`,
+`NoAnnotations`, or `Failed(rc)`. Tool-specific success and annotation
+collection rules are defined by the scenarios. Delivery requires non-blank
+`HERDR_REVIEWS_CALLER_PANE` and `HERDR_REVIEWS_CALLER_AGENT` values; any
+other child exit is `Failed(rc)`, even when output was collected.
 
 #### Scenario: Nonzero success code with agent delivers
 
@@ -69,14 +63,10 @@ the review-pane open).
 
 ### Requirement: The delivered prompt is a header plus trimmed output, capped at 64 KiB on a UTF-8 boundary
 
-The prompt sent to the agent SHALL be the header `Review annotations from
-<tool>:\n\n` — where `<tool>` is the selected catalog id `revdiff`,
-`tuicr`, or `lumen` — followed by the canonical annotation text with
-leading and trailing whitespace trimmed. The prompt SHALL be capped at
-`MAX_PROMPT_BYTES = 65536` bytes, cutting on a UTF-8 character boundary and
-appending `\n\n(output truncated; full annotations kept at <path>)` only
-when the text exceeds the cap; text that already fits is returned unchanged
-and multi-byte characters are never split.
+The prompt SHALL contain `Review annotations from <tool>:` and the
+canonical annotation text trimmed at both ends. Cap it at 65,536 bytes on
+a UTF-8 boundary and append the kept-output note only when truncation is
+needed.
 
 #### Scenario: Header names the tool that ran
 
@@ -97,15 +87,10 @@ and multi-byte characters are never split.
 
 ### Requirement: Annotations are delivered to the caller pane through the herdr CLI with defined success and failure handling
 
-Delivery SHALL run `herdr agent prompt <caller_pane> <text>` invoked via
-`HERDR_BIN_PATH` (src/herdr.rs:147-149), identically for all three tools.
-On delivery success the process SHALL, in order, print the full line
-`herdr-review: sent review annotations to agent pane <target>` to stderr,
-remove the output file (tolerating `NotFound`, logging other removal
-failures as warnings), perform a best-effort pane close, and exit 0. On
-delivery failure the process SHALL report the hard error `failed to send
-annotations to agent pane <target>: <e>; output kept at <path>`, keep the
-output file, print the error, hold the pane, and exit 1.
+Delivery SHALL run `herdr agent prompt <caller_pane> <text>` through
+`HERDR_BIN_PATH`. On success, log delivery, remove the output file
+(ignoring `NotFound`), attempt a best-effort pane close, and exit 0. On
+failure, report the error, keep the file, hold the pane, and exit 1.
 
 #### Scenario: Successful delivery tears the pane down and removes the file
 
@@ -123,18 +108,11 @@ output file, print the error, hold the pane, and exit 1.
 
 ### Requirement: Non-delivery outcomes follow fixed message and retention rules
 
-On `NoAnnotations` the process SHALL print `herdr-review: no annotations`
-to stderr, remove the output file, attempt a best-effort pane close, and
-finish successfully. On `NoAgent` it SHALL print `herdr-review: no agent in
-focused pane; annotations kept at <path>` to stderr, keep the output file,
-and hold the pane. On `Failed(rc)` it SHALL report the error `<tool> failed
-with exit code <rc>; output kept at <path>` — naming the selected tool —
-keep the file, and the pane-mode error path in main SHALL print the error,
-hold the pane, and exit 1. The output file is therefore retained on
-`Failed`, `NoAgent`, delivery failure, a revdiff read failure with a
-nonzero exit code, a tuicr adapter failure, a `.out` write failure, a lumen
-parse failure, and a killed child, and removed only on delivery success and
-`NoAnnotations`. The rules are identical for all three tools.
+`NoAnnotations` SHALL log the outcome, remove the output file, close the
+pane best-effort, and exit 0. `NoAgent` SHALL log the outcome, retain the
+file, and hold the pane. `Failed(rc)` SHALL report the tool and exit code,
+retain the file, and exit 1. Retain output on collection or delivery
+failures; remove it only after successful delivery or `NoAnnotations`.
 
 #### Scenario: No annotations cleans up silently
 
@@ -156,23 +134,12 @@ parse failure, and a killed child, and removed only on delivery success and
 
 ### Requirement: Attention outcomes hold the pane, and pane close is best-effort with a tab-close fallback
 
-The `NoAgent` outcome SHALL call `hold_pane()` after printing its message,
-and delivery failures, `Failed(rc)` runs, adapter, parse and write
-failures, and the nothing-to-review scope (owned by
-review-scope-selection) reach the same hold through the pane-mode error
-path or their own hold call; `hold_pane`'s mechanics — prompt line
-`herdr-review: press Enter to close`, stdin block, EOF behavior — belong to
-the mode-dispatch capability and are not restated here. `close_pane` SHALL
-first try `herdr plugin pane close <HERDR_PANE_ID>`, skipping that attempt
-when the variable is unset; on failure it SHALL log the full line
-`herdr-review: failed to close pane <pane>: <err>` and fall through to
-`herdr tab close <HERDR_TAB_ID>`; all close failures are logged and never
-propagated. Success-path closes are best-effort because plugin panes are
-expected to auto-close when the pane process exits.
-UNVERIFIED: this auto-close mechanism (herdr-side
-`RuntimeExitAction::ClosePane`) is attested only in AGENTS.md:15; the
-plugin manifest declares no such key, and the herdr-side behavior was not
-verified from herdr sources.
+NoAgent, failed outcomes, and `NothingToReview` SHALL hold the pane.
+On clean outcomes, attempt `herdr plugin pane close <HERDR_PANE_ID>` when
+the pane id exists; if it fails, log a warning and try
+`herdr tab close <HERDR_TAB_ID>`. Close failures SHALL never propagate.
+Success-path close is best-effort because panes close when their process
+exits.
 
 #### Scenario: Pane close falls back to tab close
 

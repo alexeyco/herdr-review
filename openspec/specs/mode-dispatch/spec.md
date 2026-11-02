@@ -18,19 +18,11 @@ with 0 or 1.
 
 ### Requirement: Mode is dispatched purely from the plugin environment
 
-The binary SHALL choose its run mode at startup from environment variables
-only, checking `HERDR_PLUGIN_ENTRYPOINT_ID` first: when it is set, its
-trimmed value selects the pane role — `review` runs the review pane mode,
-`setup` runs the read-only setup-dialog popup mode, and any other
-non-blank value fails with `unknown plugin entrypoint <value>; expected
-review or setup`.
-When the entry-point variable is unset or blank and
-`HERDR_PLUGIN_ACTION_ID` is set, the binary runs action mode. When neither
-is set it fails as "invoked outside herdr plugin context". Because the
-entry-point variable is checked first, pane modes win when both are set,
-matching herdr's action-spawns-pane nesting. A variable whose value is
-empty or whitespace-only counts as unset, via trimming, so herdr passing
-empty strings never silently selects a mode.
+At startup, the binary SHALL select its mode from environment variables,
+checking `HERDR_PLUGIN_ENTRYPOINT_ID` before `HERDR_PLUGIN_ACTION_ID`.
+Trimmed `review` and `setup` values select pane modes; another non-blank
+entrypoint fails. With no entrypoint, a set action id selects action mode;
+with neither, fail as outside herdr context. Blank values count as unset.
 
 #### Scenario: Only the entry-point variable is set
 
@@ -119,14 +111,10 @@ dialog (`Enter`/`q`/Esc) is a success path and exits 0.
 
 ### Requirement: Output convention distinguishes errors and best-effort warnings
 
-Top-level errors SHALL use the prefix `herdr-review: <msg>` on stderr and
-best-effort warnings SHALL use `herdr-review: warning: <msg>` on stderr
-(for example unreadable review output at exit 0, prune or removal
-failures, unparsable review-pane open replies, and config degradations
-including an invalid `tool` key). Pane progress lines follow the same prefix; the
-stdout progress lines pane mode prints (`herdr-review: reviewing
-<description>`, `herdr-review: nothing to review`) are owned by the
-review-scope-selection capability, not restated here.
+Top-level errors SHALL use `herdr-review: <msg>` on stderr; best-effort
+warnings SHALL use `herdr-review: warning: <msg>`. Pane progress SHALL
+use the `herdr-review:` prefix; review-scope-selection defines its stdout
+progress messages.
 
 #### Scenario: Best-effort cleanup failure warns rather than fails
 
@@ -137,25 +125,12 @@ review-scope-selection capability, not restated here.
 
 ### Requirement: The manifest declares paired action and pane entry points for one binary
 
-`herdr-plugin.toml` SHALL declare plugin id `alexeyco.review` — dots are
-legal in herdr ids, precedent `ray.plugin-manager` — with the display
-`name = "Review"`, `min_herdr_version = "0.9.0"`, and `platforms =
-["linux", "macos"]`, one action with id `open` (`contexts =
-["workspace"]`), so the keybinding/invoke command is
-`alexeyco.review.open`, and two panes whose entrypoint ids are unchanged:
-id `review` with `placement = "tab"` and id `setup` with
-`placement = "popup"`, title "Review tool setup", and the popup sizing
-keys `width = "60%"` and `height = 15`. All three entries SHALL declare
-the identical argv-form command `["./target/release/herdr-review"]` — a
-JSON/TOML array, not a shell string. The manifest `version` SHALL stay equal to the
-`Cargo.toml` version, enforced by the CI version-sync job and the
-manifest unit test; the version value itself is the maintainer's call
-(this change releases 0.2.0 per task 12).
-Evidence for popup panes being declarable: herdr-open-in
-herdr-plugin.toml:12-17 ships `placement = "popup"` for its picker pane.
-UNVERIFIED: that herdr executes array commands as argv without a shell
-layer is attested only in AGENTS.md and herdr's own documentation, not by
-any code in this repository.
+`herdr-plugin.toml` SHALL declare plugin `alexeyco.review` (`Review`,
+herdr 0.9.0+, Linux/macOS), workspace action `open`, and panes `review`
+(tab) and `setup` (popup titled `Review tool setup`, width `60%`, height
+15). All entries SHALL use the argv command
+`["./target/release/herdr-review"]`; the manifest version SHALL match
+`Cargo.toml`.
 
 #### Scenario: Both entry points resolve to the same binary
 
