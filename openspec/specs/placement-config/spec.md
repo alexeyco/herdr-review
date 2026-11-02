@@ -13,7 +13,12 @@ installed catalog and does not read the obsolete `tool` key.
 
 ### Requirement: The config file is read once per action launch from the plugin config directory
 
-The action SHALL read `<config dir>/config.toml` exactly once per launch, after context parsing and before any pane open, to resolve placement and direction only. A non-blank `HERDR_PLUGIN_CONFIG_DIR` wins outright; otherwise `herdr plugin config-dir alexeyco.review` via `HERDR_BIN_PATH` resolves the directory. Every failure degrades to `placement = "tab"` and `direction = "right"` with a warning, never failing the launch; unknown keys, including the obsolete `tool` key, are ignored. Tool selection is based only on installed tools detected on `PATH`.
+Once per launch, the action SHALL read `<config dir>/config.toml` after
+context parsing and before opening a pane. A non-blank
+`HERDR_PLUGIN_CONFIG_DIR` takes precedence; otherwise resolve the directory
+through `herdr plugin config-dir` via `HERDR_BIN_PATH`. Read only placement
+and direction. On failure, warn and use `tab`/`right`; ignore unknown keys.
+Tool selection SHALL use installed tools on `PATH`.
 
 #### Scenario: Environment directory wins
 

@@ -1,11 +1,11 @@
 # Monthly freshness check of the README `## Comparison` section: machine
-# drift opens (or updates) the rolling dual-update fix PR, drift the
+# drift opens (or updates) the rolling fix PR, drift the
 # script must not rewrite files or updates the single `comparison-drift`
 # issue — drift is alarmed, not a build failure, so those runs stay
 # green — and an unreachable source goes red without opening a PR or
 # filing an issue: a run that could not reach its sources cannot vouch
 # for the table.
-name: comparison-freshness
+name: Comparison Freshness
 
 on:
   schedule:
@@ -38,14 +38,6 @@ jobs:
       # (authenticated 5000/h instead of the shared-runner-IP anonymous
       # 60/h) and the issue step's REST calls.
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      # DUAL-UPDATE RULE: on drift, update BOTH the README `## Comparison`
-      # release cells and this line together — the script judges these
-      # values against the live sources and checks the README's presence
-      # substrings against them; `--fix` moves the two surfaces as one.
-      # No self entry for alexeyco/herdr-review: the subject's release
-      # cell is deliberately unpinned, so there is no machine-checkable
-      # self release fact.
-      EXPECT_REPOS: persiyanov/herdr-reviewr@v0.46.0,jhochenbaum/herdr-hunk-diff@v0.5.0,JanSmrcka/differ@v1.8.1,quantk/herdr-review@v0.2.7,skellleks/lasso@v0.1.0
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -53,6 +45,8 @@ jobs:
           node-version: 22
           # No cache key and no npm ci: the script imports Node builtins
           # only, so dependencies are never installed.
+      - name: Load comparison expectations
+        run: echo "EXPECT_REPOS=$(cat .github/comparison-expected-repos.txt)" >> "$GITHUB_ENV"
       - name: Check the README comparison table
         id: check
         # Capture the exit code instead of failing the step: 0 clean,
@@ -68,7 +62,7 @@ jobs:
           case "$code" in 0|1|2) ;; *) echo "comparison-check: unknown exit code $code" >&2; exit "$code";; esac
           echo "code=$code" >> "$GITHUB_OUTPUT"
           exit 0
-      - name: Dual-update the README release cells and the workflow env line
+      - name: Update the README release cells and expectations file
         if: steps.check.outputs.code == '1'
         # A failing --fix (exit 2 — a live source unreachable) reddens the
         # run and skips the PR and issue steps: the same alarm philosophy
@@ -81,12 +75,13 @@ jobs:
         # ci.yml prettier check on the master push after merge — write
         # before the commit. A no-op when the fixer changed nothing.
         run: npx --yes prettier@3.9.6 --write README.md
-      - name: Open the rolling dual-update fix PR
+      - name: Open the rolling fix PR
         if: steps.check.outputs.code == '1'
         # Rolling semantics: while a PR on this branch is open, the next
         # drifting run updates it instead of opening a second PR.
-        # add-paths is the PR write set: only the two dual-update surfaces
-        # (README.md and this workflow) may ever enter a commit. The
+        # add-paths is the PR write set: only the README and mutable
+        # expectations data may ever enter a commit. Keep this workflow
+        # static so the built-in token can push the PR branch.
         # check step's drift-report.md (issue-only drift writes it at the
         # repo root) is unmatched — the action stashes and restores
         # unmatched files, so the report stays out of the PR (no
@@ -102,17 +97,17 @@ jobs:
           delete-branch: true
           add-paths: |
             README.md
-            .github/workflows/comparison-freshness.yml
-          commit-message: "Comparison: dual-update release tags (monthly freshness run)"
-          title: "Comparison: dual-update release tags (monthly freshness run)"
+            .github/comparison-expected-repos.txt
+          commit-message: "Comparison: update release tags (monthly freshness run)"
+          title: "Comparison: update release tags (monthly freshness run)"
           body: |
             ## What
 
-            Monthly `comparison-freshness` run: the fixer dual-updated the
-            README `## Comparison` release cells and this workflow's
-            `EXPECT_REPOS` line together — the two surfaces always move as
-            one. While this PR is open, the next drifting run updates this
-            same branch instead of opening a second PR; `delete-branch`
+            Monthly `Comparison Freshness` run: the fixer updates the
+            README `## Comparison` release cells and the expectations file
+            together — the two surfaces always move as one. While this PR
+            is open, the next drifting run updates this same branch instead
+            of opening a second PR; `delete-branch`
             cleans up after merge. Issue-only findings, if any, are alarmed
             in the separate `comparison-drift` issue, not here.
 

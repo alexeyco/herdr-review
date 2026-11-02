@@ -13,43 +13,13 @@ machine-checkable surface to guard.
 
 ### Requirement: README carries a sourced, dated Comparison section
 
-The README SHALL carry a `## Comparison` section placed directly after
-the `## Quickstart` section and before `## The flow` and `## Why` — the
-`##` heading order is Quickstart, Comparison, The flow, Why, with every
-other heading unchanged. Inside the section, in this order:
-
-1. one intro sentence and the legend line
-   `✅ documented in the linked sources · ⚠️ partial or implemented differently · ❌ not found in the public sources checked`;
-2. the at-a-glance matrix: 7 axis rows × 6 columns (this plugin plus the
-   five competitors reviewr, hunk-diff, differ, quantk, lasso), each
-   competitor column header linking its GitHub repo, cells carrying
-   ✅/⚠️/❌;
-3. the numbered footnote block whose definitions carry the public source
-   links, markers unique and numbered in reading order;
-4. the dated line
-   `All cells checked 2026-10-18 against the linked public sources.`;
-5. a `<details>` block summarized `Detailed comparison` holding the
-   detailed table with the rows Delivery form, Underlying tool, Latest
-   release, and License / language over the same six columns;
-6. the positioning paragraph.
-
-The seven matrix axes SHALL be, in order: ships a herdr-plugin manifest
-(installs via `herdr plugin install`); human-authored line annotations;
-dedicated git-diff review surface; delivers on close, no extra keypress
-(annotations reach the agent pane when the review closes — key- or
-action-triggered delivery is ⚠️); agent-agnostic delivery; no LLM keys or
-accounts in the core flow; user-selectable underlying review tool.
-
-In the detailed table's Latest release row, each of the five competitor
-cells SHALL carry exactly the shape
-`[<tag>](https://github.com/<owner>/<repo>/releases/tag/<tag>)`, the cell
-tag equal to the tag currently pinned for that repo in the workflow env's
-`EXPECT_REPOS` line — the dual-update keeps cell and env in step; the cell
-SHALL carry no release date (dates are not machine-checked and would rot
-silently). The subject column's cell SHALL link the repo's releases page
-without a pinned tag — the subject is deliberately unpinned, so there is
-no machine-checkable self release fact and none is a freshness
-expectation.
+The README SHALL place `## Comparison` after Quickstart and before The
+flow and Why. It SHALL contain an intro and legend, a seven-axis matrix
+over six columns, numbered source footnotes, a dated audit line, a
+Detailed comparison table, and a positioning paragraph, in that order.
+Competitor release cells SHALL use the tag from
+`.github/comparison-expected-repos.txt` and link to that release without
+a date; the subject cell SHALL link to its unpinned releases page.
 
 #### Scenario: Heading order puts Comparison after Quickstart
 
@@ -84,20 +54,11 @@ expectation.
 
 ### Requirement: Every factual cell is sourced and the legend defines the states
 
-Every factual cell of both tables SHALL carry a source that supports it:
-a uniquely numbered footnote whose definition carries a public link (the
-competitor's GitHub repo, or — for file-level evidence — a tag-pinned
-blob URL at that repo), or, for bare ❌ matrix cells, the legend's
-`not found in the public sources checked` rule: a bare ❌ states that the
-feature is not documented in the project's public sources, negative
-searches performed 2026-10-18, and is a sourced negative claim under the
-dated line. Every ⚠️ cell and every ✅/❌ cell whose evidence is not
-self-evident from the linked repo root SHALL carry a footnote; markers
-SHALL be unique and numbered in reading order, none reused — identical
-evidence used at two positions yields two numbered definitions with
-identical text. The dated line SHALL sit directly under the footnote
-block and cover both tables; it records the human audit and is never
-edited by the freshness bot.
+Both tables SHALL source every factual cell through a uniquely numbered
+footnote, a direct link, or the legend's dated not-found rule for bare ❌
+cells. Footnote markers SHALL be unique and ordered by appearance. The
+dated audit line SHALL follow the footnotes, cover both tables, and remain
+untouched by the freshness workflow.
 
 #### Scenario: Legend defines the three states
 
@@ -119,16 +80,10 @@ edited by the freshness bot.
 
 ### Requirement: Comparison stays neutral and claims only the defensible combination
 
-The section SHALL use neutral, factual language — no evaluative verdicts
-("better", "worse", "inferior"); absences are stated as sourced facts
-linked to the competitor's public sources. The positioning paragraph's
-uniqueness claim SHALL be limited to the combination of (1) annotation
-delivery into the agent pane on review close with no extra keypress and
-(2) the user-selectable underlying review tool — the two axes where the
-matrix shows this plugin as the only ✅ (all five competitors deliver by
-key or action and ship a single built-in viewer). No broader "only tool
-that …" statement SHALL appear, and no single-axis uniqueness SHALL be
-claimed beyond what the matrix cells evidence.
+The section SHALL use neutral, sourced language and avoid evaluative
+claims. Its positioning SHALL claim uniqueness only for the combination
+of delivery on review close without another keypress and user-selectable
+review tools, as supported by the matrix.
 
 #### Scenario: Unique-combination claim only
 

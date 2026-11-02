@@ -6,7 +6,7 @@
 //   node scripts/check-comparison.mjs [--readme <path>] [--report <path>]
 //                                     [--summary <path>]
 //   node scripts/check-comparison.mjs --fix [--readme <path>]
-//                                     [--workflow <path>]
+//                                     [--expectations <path>]
 //   node scripts/check-comparison.mjs --report-issue <path>
 //
 // Three modes. Check mode (the default) takes every expected value from
@@ -18,7 +18,7 @@
 // release-cell presence (pure case-sensitive substring search, never a
 // structural parse). The README is read exactly once — feeding both the
 // liveness URL set and the presence substrings. `--fix` dual-updates
-// the README release cells and the workflow's EXPECT_REPOS line to the
+// the README release cells and the expectations file to the
 // live tags; drift the fixer must not rewrite is routed to the report
 // the issue mode consumes. Issue mode reads the drift report written by
 // `--report` and creates or updates the single `comparison-drift` issue
@@ -60,7 +60,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PREFIX = "comparison-check:";
 const USAGE =
   "node scripts/check-comparison.mjs [--readme <path>] [--report <path>]" +
-  " [--summary <path>] | --fix [--readme <path>] [--workflow <path>]" +
+  " [--summary <path>] | --fix [--readme <path>] [--expectations <path>]" +
   " | --report-issue <path>";
 const ATTEMPT_TIMEOUT_MS = 10_000;
 const RETRY_DELAY_MS = 2_000;
@@ -498,7 +498,7 @@ function renderReport(drift) {
     table,
     "",
     "Fix: these findings are not machine-fixable — update the README by",
-    "hand (and the workflow env line when a release expectation moved),",
+    "hand (and the expectations file when a release expectation moved),",
     "then close this issue; the next monthly run re-files it if drift",
     "persists.",
     "",
@@ -768,28 +768,6 @@ function cellReplacement(entry, liveTag) {
   );
 }
 
-// Locate the single `EXPECT_REPOS:` line and return its pieces: the
-// line array, the index, the leading part (indentation + key + colon +
-// spacing), the split segments, and whether the line ended with a CR.
-// The value stays on one line — the line-oriented rewrite depends on it.
-function readEnvLine(workflowText, workflowPath) {
-  const lines = workflowText.split("\n");
-  const idx = lines.findIndex((line) => line.trim().startsWith("EXPECT_REPOS:"));
-  if (idx === -1) {
-    say(`✗ no EXPECT_REPOS: line in ${workflowPath}`);
-    process.exit(2);
-  }
-  const rawLine = lines[idx];
-  const hadCr = rawLine.endsWith("\r");
-  const lineBody = hadCr ? rawLine.slice(0, -1) : rawLine;
-  const match = lineBody.match(/^(\s*EXPECT_REPOS:\s*)(.*)$/);
-  if (!match) {
-    say(`✗ malformed EXPECT_REPOS: line in ${workflowPath}`);
-    process.exit(2);
-  }
-  return { lines, idx, lead: match[1], segments: match[2].split(","), hadCr };
-}
-
 // Dual-update: for each entry, GET releases/latest from the live API
 // (fix mode re-GETs instead of consuming check-mode artifacts — the
 // modes stay independently runnable and the fix never trusts a stale
@@ -798,13 +776,13 @@ function readEnvLine(workflowText, workflowPath) {
 // mismatched, so a hand-broken README cell heals in the same run); 404 →
 // skip untouched (the issue path owns it); a 200 whose anchored cell
 // shape matches nowhere in the README, or whose env segment is missing
-// from the workflow line → skip untouched with a loud skip line (check
+// from the expectations file → skip untouched with a loud skip line (check
 // mode routes that state to missing-cell, issue-only, and the fixer
 // cannot recreate a deleted row — skipping keeps the workflow green so
 // the issue step still alarms); anything else → abort. All replacements
 // are computed in memory before any write, so an abort leaves both
 // files byte-identical to their pre-run state.
-async function runFixMode(readmePath, workflowPath) {
+async function runFixMode(readmePath, expectationsPath) {
   const envFindings = [];
   const entries = parseExpectRepos(envFindings);
   if (envFindings.length > 0) {
@@ -820,14 +798,14 @@ async function runFixMode(readmePath, workflowPath) {
     say(`✗ cannot read README ${readmePath}: ${err.message}`);
     process.exit(2);
   }
-  let workflowText;
+  let expectationsText;
   try {
-    workflowText = readFileSync(workflowPath, "utf-8");
+    expectationsText = readFileSync(expectationsPath, "utf-8");
   } catch (err) {
-    say(`✗ cannot read workflow ${workflowPath}: ${err.message}`);
+    say(`✗ cannot read expectations ${expectationsPath}: ${err.message}`);
     process.exit(2);
   }
-  const envLine = readEnvLine(workflowText, workflowPath);
+  const segments = expectationsText.trim().split(",");
 
   let readmeResult = readmeText;
   for (const entry of entries) {
@@ -858,12 +836,12 @@ async function runFixMode(readmePath, workflowPath) {
     }
     const live = r.tag;
 
-    const segIdx = envLine.segments.findIndex((segment) =>
+    const segIdx = segments.findIndex((segment) =>
       segment.trim().startsWith(`${entry.owner}/${entry.repo}@`),
     );
     if (segIdx === -1) {
       say(
-        `skip ${entry.owner}/${entry.repo}: no ${entry.owner}/${entry.repo}@ segment in the EXPECT_REPOS: line of ${workflowPath}`,
+        `skip ${entry.owner}/${entry.repo}: no ${entry.owner}/${entry.repo}@ entry in ${expectationsPath}`,
       );
       continue;
     }
@@ -884,17 +862,15 @@ async function runFixMode(readmePath, workflowPath) {
       new RegExp(pattern, "g"),
       () => cellReplacement(entry, live),
     );
-    envLine.segments[segIdx] = `${entry.owner}/${entry.repo}@${live}`;
+    segments[segIdx] = `${entry.owner}/${entry.repo}@${live}`;
     say(`converged ${entry.owner}/${entry.repo} to ${live}`);
   }
 
-  envLine.lines[envLine.idx] =
-    envLine.lead + envLine.segments.join(",") + (envLine.hadCr ? "\r" : "");
-  const workflowResult = envLine.lines.join("\n");
+  const expectationsResult = `${segments.join(",")}\n`;
 
   try {
     writeFileSync(readmePath, readmeResult);
-    writeFileSync(workflowPath, workflowResult);
+    writeFileSync(expectationsPath, expectationsResult);
   } catch (err) {
     say(`✗ write failed: ${err?.message ?? err}`);
     process.exit(2);
@@ -963,7 +939,7 @@ async function runCheckMode(readmePath, reportPath, summaryPath) {
 function parseArgs(argv) {
   const opts = {
     readme: join(ROOT, "README.md"),
-    workflow: join(ROOT, ".github/workflows/comparison-freshness.yml"),
+    expectations: join(ROOT, ".github/comparison-expected-repos.txt"),
     report: null,
     summary: null,
     fix: false,
@@ -979,7 +955,7 @@ function parseArgs(argv) {
       arg !== "--readme" &&
       arg !== "--report" &&
       arg !== "--summary" &&
-      arg !== "--workflow" &&
+      arg !== "--expectations" &&
       arg !== "--report-issue"
     ) {
       say(`usage: unknown argument ${arg}`);
@@ -993,7 +969,7 @@ function parseArgs(argv) {
       process.exit(2);
     }
     if (arg === "--readme") opts.readme = value;
-    else if (arg === "--workflow") opts.workflow = value;
+    else if (arg === "--expectations") opts.expectations = value;
     else if (arg === "--report") opts.report = value;
     else if (arg === "--summary") opts.summary = value;
     else opts.reportIssue = value;
@@ -1012,7 +988,7 @@ try {
   if (opts.reportIssue) {
     await runIssueMode(opts.reportIssue);
   } else if (opts.fix) {
-    await runFixMode(opts.readme, opts.workflow);
+    await runFixMode(opts.readme, opts.expectations);
   } else {
     await runCheckMode(opts.readme, opts.report, opts.summary);
   }
